@@ -91,6 +91,10 @@ pub struct GenerationRequest {
     #[serde(default)]
     pub reference_audio: Option<String>,
 
+    /// Reference text/transcript for voice cloning
+    #[serde(default)]
+    pub reference_text: Option<String>,
+
     /// Voice description for voice design models
     #[serde(default)]
     pub voice_description: Option<String>,
@@ -107,6 +111,7 @@ impl GenerationRequest {
             text: text.into(),
             config: GenerationConfig::default(),
             reference_audio: None,
+            reference_text: None,
             voice_description: None,
         }
     }

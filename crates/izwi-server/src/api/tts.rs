@@ -99,6 +99,7 @@ pub async fn generate(
         text: req.text,
         config: gen_config,
         reference_audio: req.reference_audio,
+        reference_text: req.reference_text,
         voice_description: req.voice_description,
     };
 
@@ -170,6 +171,7 @@ pub async fn generate_stream(
         text: req.text,
         config: gen_config,
         reference_audio: req.reference_audio,
+        reference_text: req.reference_text,
         voice_description: req.voice_description,
     };
 

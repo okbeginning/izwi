@@ -107,14 +107,73 @@ def generate_tts(request: dict) -> dict:
             # Decode base64 audio to numpy array
             audio_bytes = base64.b64decode(ref_audio_b64)
 
-            # Save to temp file to load with soundfile
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                ref_audio_path = f.name
-                f.write(audio_bytes)
+            # Try to load audio using different methods
+            ref_audio_array = None
+            ref_sr = None
+            ref_audio_path = None
 
             try:
-                # Load reference audio
-                ref_audio_array, ref_sr = sf.read(ref_audio_path)
+                # First, try loading directly with soundfile (works for WAV, FLAC, OGG)
+                import io
+
+                try:
+                    ref_audio_array, ref_sr = sf.read(io.BytesIO(audio_bytes))
+                except Exception:
+                    pass
+
+                # If that failed, try pydub (handles WebM, MP3, etc.)
+                if ref_audio_array is None:
+                    try:
+                        from pydub import AudioSegment
+                        import io as io_module
+
+                        # Load audio with pydub (auto-detects format)
+                        audio_segment = AudioSegment.from_file(
+                            io_module.BytesIO(audio_bytes)
+                        )
+
+                        # Convert to mono if stereo
+                        if audio_segment.channels > 1:
+                            audio_segment = audio_segment.set_channels(1)
+
+                        # Get sample rate and samples
+                        ref_sr = audio_segment.frame_rate
+                        samples = audio_segment.get_array_of_samples()
+
+                        # Convert to numpy float array normalized to [-1, 1]
+                        ref_audio_array = np.array(samples, dtype=np.float32)
+                        ref_audio_array = ref_audio_array / (
+                            2 ** (audio_segment.sample_width * 8 - 1)
+                        )
+
+                    except ImportError:
+                        # pydub not available, fall back to temp file approach
+                        pass
+                    except Exception as e:
+                        print(f"pydub failed: {e}", file=sys.stderr)
+
+                # Last resort: save to temp file and try different extensions
+                if ref_audio_array is None:
+                    for ext in [".webm", ".mp3", ".ogg", ".wav", ".m4a"]:
+                        try:
+                            with tempfile.NamedTemporaryFile(
+                                suffix=ext, delete=False
+                            ) as f:
+                                ref_audio_path = f.name
+                                f.write(audio_bytes)
+
+                            ref_audio_array, ref_sr = sf.read(ref_audio_path)
+                            break
+                        except Exception:
+                            if ref_audio_path and os.path.exists(ref_audio_path):
+                                os.unlink(ref_audio_path)
+                                ref_audio_path = None
+                            continue
+
+                if ref_audio_array is None:
+                    return {
+                        "error": "Could not decode reference audio. Please upload a WAV, MP3, or OGG file."
+                    }
 
                 # Generate with voice cloning
                 wavs, sr = model.generate_voice_clone(
@@ -124,7 +183,8 @@ def generate_tts(request: dict) -> dict:
                     ref_text=ref_text,
                 )
             finally:
-                os.unlink(ref_audio_path)
+                if ref_audio_path and os.path.exists(ref_audio_path):
+                    os.unlink(ref_audio_path)
 
         elif "CustomVoice" in model_id:
             wavs, sr = model.generate_custom_voice(

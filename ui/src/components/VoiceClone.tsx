@@ -47,9 +47,33 @@ export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
   const startRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream);
+
+      // Try to use a format that's more compatible with backend processing
+      // Prefer formats in order: wav, ogg, webm
+      const mimeTypes = [
+        "audio/wav",
+        "audio/ogg",
+        "audio/ogg;codecs=opus",
+        "audio/webm;codecs=opus",
+        "audio/webm",
+      ];
+
+      let selectedMimeType = "";
+      for (const mimeType of mimeTypes) {
+        if (MediaRecorder.isTypeSupported(mimeType)) {
+          selectedMimeType = mimeType;
+          break;
+        }
+      }
+
+      const options = selectedMimeType
+        ? { mimeType: selectedMimeType }
+        : undefined;
+      const mediaRecorder = new MediaRecorder(stream, options);
       mediaRecorderRef.current = mediaRecorder;
       chunksRef.current = [];
+
+      const actualMimeType = mediaRecorder.mimeType || "audio/webm";
 
       mediaRecorder.ondataavailable = (e) => {
         if (e.data.size > 0) {
@@ -58,7 +82,7 @@ export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
       };
 
       mediaRecorder.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+        const blob = new Blob(chunksRef.current, { type: actualMimeType });
         setAudioBlob(blob);
         const url = URL.createObjectURL(blob);
         setAudioUrl(url);

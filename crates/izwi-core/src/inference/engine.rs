@@ -139,12 +139,14 @@ impl InferenceEngine {
         info!("Generating TTS for: {}", request.text);
 
         // Use Python bridge for actual inference
-        let (samples, sample_rate) = self.python_bridge.generate(
+        let (samples, sample_rate) = self.python_bridge.generate_with_clone(
             model_path,
             &request.text,
             request.config.speaker.as_deref(),
             Some("Auto"), // language
             None,         // instruct
+            request.reference_audio,
+            request.reference_text,
         )?;
 
         let total_time_ms = start_time.elapsed().as_secs_f32() * 1000.0;
