@@ -146,22 +146,6 @@ export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
 
   return (
     <div className="space-y-3">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h3 className="text-sm font-medium text-white">Voice Cloning</h3>
-          <p className="text-xs text-gray-600 mt-0.5">
-            Upload or record a voice sample
-          </p>
-        </div>
-        {audioBlob && (
-          <button onClick={handleClear} className="btn btn-ghost text-xs">
-            <X className="w-3.5 h-3.5" />
-            Clear
-          </button>
-        )}
-      </div>
-
       {/* Error */}
       <AnimatePresence>
         {error && (
@@ -176,6 +160,25 @@ export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
         )}
       </AnimatePresence>
 
+      {/* Transcript input - always visible */}
+      <div>
+        <label className="block text-xs text-gray-500 mb-1.5">
+          Transcript
+          <span className="text-red-400 ml-1">*</span>
+        </label>
+        <textarea
+          value={transcript}
+          onChange={(e) => setTranscript(e.target.value)}
+          placeholder="Enter what you will say in the recording..."
+          rows={3}
+          className="textarea text-sm"
+        />
+        <p className="text-xs text-gray-600 mt-1">
+          Type what you'll say, then record or upload audio
+        </p>
+      </div>
+
+      {/* Audio controls */}
       {!audioBlob ? (
         <div className="grid grid-cols-2 gap-2">
           {/* Upload button */}
@@ -243,33 +246,21 @@ export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
             />
           </div>
 
-          {/* Transcript input */}
-          <div>
-            <label className="block text-xs text-gray-500 mb-1.5">
-              Transcript
-              <span className="text-red-400 ml-1">*</span>
-            </label>
-            <textarea
-              value={transcript}
-              onChange={(e) => setTranscript(e.target.value)}
-              placeholder="Enter what is said in the audio..."
-              rows={3}
-              className="textarea text-sm"
-            />
-            <p className="text-xs text-gray-600 mt-1">
-              Provide an accurate transcript of the audio for best results
-            </p>
+          {/* Action buttons */}
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleConfirm}
+              disabled={!transcript.trim()}
+              className="btn btn-primary flex-1 text-sm"
+            >
+              <Check className="w-4 h-4" />
+              Use This Voice
+            </button>
+            <button onClick={handleClear} className="btn btn-ghost text-sm">
+              <X className="w-3.5 h-3.5" />
+              Clear
+            </button>
           </div>
-
-          {/* Confirm button */}
-          <button
-            onClick={handleConfirm}
-            disabled={!transcript.trim()}
-            className="btn btn-primary w-full text-sm"
-          >
-            <Check className="w-4 h-4" />
-            Use This Voice
-          </button>
         </div>
       )}
     </div>
