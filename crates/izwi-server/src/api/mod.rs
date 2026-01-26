@@ -1,5 +1,6 @@
 //! API routes and handlers
 
+mod daemon;
 mod health;
 mod models;
 mod tts;
@@ -18,6 +19,11 @@ pub fn create_router(state: AppState) -> Router {
     let api_routes = Router::new()
         // Health check
         .route("/health", get(health::health_check))
+        // Daemon management
+        .route("/daemon/status", get(daemon::get_status))
+        .route("/daemon/start", post(daemon::start_daemon))
+        .route("/daemon/stop", post(daemon::stop_daemon))
+        .route("/daemon/preload", post(daemon::preload_model))
         // Model management
         .route("/models", get(models::list_models))
         .route("/models/:variant/download", post(models::download_model))

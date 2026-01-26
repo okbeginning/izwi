@@ -311,6 +311,27 @@ impl InferenceEngine {
     pub fn audio_encoder(&self) -> AudioEncoder {
         AudioEncoder::new(self.codec.sample_rate(), 1)
     }
+
+    /// Ensure the TTS daemon is running
+    pub fn ensure_daemon_running(&self) -> Result<()> {
+        self.python_bridge.ensure_daemon_running()
+    }
+
+    /// Stop the TTS daemon
+    pub fn stop_daemon(&self) -> Result<()> {
+        self.python_bridge.stop_daemon()
+    }
+
+    /// Get daemon status
+    pub fn get_daemon_status(&self) -> Result<super::python_bridge::PythonTTSResponse> {
+        self.python_bridge.get_status()
+    }
+
+    /// Preload a model into the daemon cache
+    pub fn preload_model(&self, model_path: &str) -> Result<()> {
+        self.python_bridge
+            .preload_model(std::path::Path::new(model_path))
+    }
 }
 
 // Simple pseudo-random number generator for placeholder
