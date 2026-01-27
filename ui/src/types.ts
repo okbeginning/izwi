@@ -52,9 +52,9 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     description: "Audio-to-audio chat with LFM2-Audio",
     icon: "AudioWaveform",
     modelFilter: (variant) => variant.includes("LFM2-Audio"),
-    emptyStateTitle: "LFM2-Audio Ready",
+    emptyStateTitle: "No LFM2-Audio Model Loaded",
     emptyStateDescription:
-      "Start a conversation with audio input and get audio responses",
+      "Download and load the LFM2-Audio model for TTS, ASR, and audio chat",
   },
 };
 

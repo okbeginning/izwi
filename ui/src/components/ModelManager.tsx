@@ -74,6 +74,14 @@ const MODEL_DETAILS: Record<
     features: ["Text-to-voice", "Creative control", "Unique voices"],
     size: "3.4 GB",
   },
+  "LFM2-Audio-1.5B": {
+    shortName: "LFM2 1.5B",
+    fullName: "LFM2-Audio 1.5B by Liquid AI",
+    description:
+      "End-to-end audio foundation model for TTS, ASR, and audio chat",
+    features: ["TTS", "ASR", "Audio-to-audio chat", "4 voice styles"],
+    size: "3.0 GB",
+  },
 };
 
 export function ModelManager({

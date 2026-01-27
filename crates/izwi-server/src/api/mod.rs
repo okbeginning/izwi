@@ -36,6 +36,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/tts/stream", post(tts::generate_stream))
         // LFM2-Audio endpoints
         .route("/lfm2/status", get(lfm2::status))
+        .route("/lfm2/start", post(lfm2::start_daemon))
+        .route("/lfm2/stop", post(lfm2::stop_daemon))
         .route("/lfm2/tts", post(lfm2::tts))
         .route("/lfm2/asr", post(lfm2::asr))
         .route("/lfm2/chat", post(lfm2::chat));

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Available Qwen3-TTS model variants
+/// Available TTS model variants
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModelVariant {
     /// 0.6B parameter base model
@@ -24,6 +24,9 @@ pub enum ModelVariant {
     /// Tokenizer for 12Hz codec
     #[serde(rename = "Qwen3-TTS-Tokenizer-12Hz")]
     Qwen3TtsTokenizer12Hz,
+    /// LFM2-Audio 1.5B model from Liquid AI
+    #[serde(rename = "LFM2-Audio-1.5B")]
+    Lfm2Audio15B,
 }
 
 impl ModelVariant {
@@ -36,6 +39,7 @@ impl ModelVariant {
             Self::Qwen3Tts12Hz17BCustomVoice => "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
             Self::Qwen3Tts12Hz17BVoiceDesign => "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
             Self::Qwen3TtsTokenizer12Hz => "Qwen/Qwen3-TTS-Tokenizer-12Hz",
+            Self::Lfm2Audio15B => "LiquidAI/LFM2-Audio-1.5B",
         }
     }
 
@@ -48,6 +52,7 @@ impl ModelVariant {
             Self::Qwen3Tts12Hz17BCustomVoice => "Qwen3-TTS 1.7B CustomVoice",
             Self::Qwen3Tts12Hz17BVoiceDesign => "Qwen3-TTS 1.7B VoiceDesign",
             Self::Qwen3TtsTokenizer12Hz => "Qwen3-TTS Tokenizer 12Hz",
+            Self::Lfm2Audio15B => "LFM2-Audio 1.5B",
         }
     }
 
@@ -60,6 +65,7 @@ impl ModelVariant {
             Self::Qwen3Tts12Hz17BCustomVoice => "Qwen3-TTS-12Hz-1.7B-CustomVoice",
             Self::Qwen3Tts12Hz17BVoiceDesign => "Qwen3-TTS-12Hz-1.7B-VoiceDesign",
             Self::Qwen3TtsTokenizer12Hz => "Qwen3-TTS-Tokenizer-12Hz",
+            Self::Lfm2Audio15B => "LFM2-Audio-1.5B",
         }
     }
 
@@ -72,6 +78,7 @@ impl ModelVariant {
             Self::Qwen3Tts12Hz17BCustomVoice => 3_400_000_000,
             Self::Qwen3Tts12Hz17BVoiceDesign => 3_400_000_000,
             Self::Qwen3TtsTokenizer12Hz => 500_000_000, // ~500MB
+            Self::Lfm2Audio15B => 3_000_000_000,        // ~3GB
         }
     }
 
@@ -83,12 +90,18 @@ impl ModelVariant {
             | Self::Qwen3Tts12Hz17BCustomVoice
             | Self::Qwen3Tts12Hz17BVoiceDesign => 6.0,
             Self::Qwen3TtsTokenizer12Hz => 1.0,
+            Self::Lfm2Audio15B => 6.0,
         }
     }
 
     /// Whether this is a tokenizer/codec model
     pub fn is_tokenizer(&self) -> bool {
         matches!(self, Self::Qwen3TtsTokenizer12Hz)
+    }
+
+    /// Whether this is an LFM2-Audio model
+    pub fn is_lfm2(&self) -> bool {
+        matches!(self, Self::Lfm2Audio15B)
     }
 
     /// Get all available variants
@@ -100,6 +113,7 @@ impl ModelVariant {
             Self::Qwen3Tts12Hz17BCustomVoice,
             Self::Qwen3Tts12Hz17BVoiceDesign,
             Self::Qwen3TtsTokenizer12Hz,
+            Self::Lfm2Audio15B,
         ]
     }
 }

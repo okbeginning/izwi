@@ -21,7 +21,15 @@ interface Message {
   audioBlob?: Blob;
 }
 
-export function LFM2AudioPlayground() {
+interface LFM2AudioPlaygroundProps {
+  selectedModel: string | null;
+  onModelRequired: () => void;
+}
+
+export function LFM2AudioPlayground({
+  selectedModel,
+  onModelRequired,
+}: LFM2AudioPlaygroundProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -33,6 +41,10 @@ export function LFM2AudioPlayground() {
   const audioRef = useRef<HTMLAudioElement>(null);
 
   const startRecording = useCallback(async () => {
+    if (!selectedModel) {
+      onModelRequired();
+      return;
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mediaRecorder = new MediaRecorder(stream);
@@ -59,7 +71,7 @@ export function LFM2AudioPlayground() {
     } catch (err) {
       setError("Could not access microphone. Please grant permission.");
     }
-  }, []);
+  }, [selectedModel, onModelRequired]);
 
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current && isRecording) {
@@ -135,6 +147,10 @@ export function LFM2AudioPlayground() {
   };
 
   const handleTextSubmit = async () => {
+    if (!selectedModel) {
+      onModelRequired();
+      return;
+    }
     if (!textInput.trim() || isProcessing) return;
 
     setIsProcessing(true);

@@ -109,6 +109,7 @@ fn parse_variant(s: &str) -> Result<ModelVariant, ApiError> {
         "Qwen3-TTS-12Hz-1.7B-CustomVoice" => return Ok(ModelVariant::Qwen3Tts12Hz17BCustomVoice),
         "Qwen3-TTS-12Hz-1.7B-VoiceDesign" => return Ok(ModelVariant::Qwen3Tts12Hz17BVoiceDesign),
         "Qwen3-TTS-Tokenizer-12Hz" => return Ok(ModelVariant::Qwen3TtsTokenizer12Hz),
+        "LFM2-Audio-1.5B" => return Ok(ModelVariant::Lfm2Audio15B),
         _ => {}
     }
 
@@ -137,9 +138,12 @@ fn parse_variant(s: &str) -> Result<ModelVariant, ApiError> {
     if normalized.contains("tokenizer") {
         return Ok(ModelVariant::Qwen3TtsTokenizer12Hz);
     }
+    if normalized.contains("lfm2") && normalized.contains("audio") {
+        return Ok(ModelVariant::Lfm2Audio15B);
+    }
 
     Err(ApiError::bad_request(format!(
-        "Unknown model variant: {}. Valid variants: Qwen3-TTS-12Hz-0.6B-Base, Qwen3-TTS-12Hz-0.6B-CustomVoice, Qwen3-TTS-12Hz-1.7B-Base, Qwen3-TTS-12Hz-1.7B-CustomVoice, Qwen3-TTS-12Hz-1.7B-VoiceDesign, Qwen3-TTS-Tokenizer-12Hz",
+        "Unknown model variant: {}. Valid variants: Qwen3-TTS-12Hz-0.6B-Base, Qwen3-TTS-12Hz-0.6B-CustomVoice, Qwen3-TTS-12Hz-1.7B-Base, Qwen3-TTS-12Hz-1.7B-CustomVoice, Qwen3-TTS-12Hz-1.7B-VoiceDesign, Qwen3-TTS-Tokenizer-12Hz, LFM2-Audio-1.5B",
         s
     )))
 }

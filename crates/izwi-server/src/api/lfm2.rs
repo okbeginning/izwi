@@ -1,14 +1,13 @@
 //! LFM2-Audio API endpoints
 //!
 //! Handles TTS, ASR, and audio-to-audio chat via the LFM2 daemon.
+//! Uses the InferenceEngine's LFM2Bridge for daemon lifecycle management.
 
-use axum::{http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use tracing::info;
 
-const LFM2_SOCKET_PATH: &str = "/tmp/izwi_lfm2_daemon.sock";
+use crate::state::AppState;
 
 /// LFM2 TTS request
 #[derive(Debug, Deserialize)]
@@ -77,10 +76,18 @@ pub struct LFM2AudioChatResponse {
 /// LFM2 Status response
 #[derive(Debug, Serialize)]
 pub struct LFM2StatusResponse {
+    pub running: bool,
     pub status: String,
     pub device: Option<String>,
     pub cached_models: Vec<String>,
     pub voices: Vec<String>,
+}
+
+/// LFM2 Daemon response
+#[derive(Debug, Serialize)]
+pub struct LFM2DaemonResponse {
+    pub success: bool,
+    pub message: String,
 }
 
 /// Error response
@@ -94,99 +101,92 @@ pub struct ErrorDetail {
     pub message: String,
 }
 
-fn send_daemon_request(request: serde_json::Value) -> Result<serde_json::Value, String> {
-    let mut stream = UnixStream::connect(LFM2_SOCKET_PATH).map_err(|e| {
-        format!(
-            "Failed to connect to LFM2 daemon: {}. Make sure the daemon is running.",
-            e
-        )
-    })?;
-
-    let data =
-        serde_json::to_vec(&request).map_err(|e| format!("JSON serialization error: {}", e))?;
-    let length = (data.len() as u32).to_be_bytes();
-
-    stream
-        .write_all(&length)
-        .map_err(|e| format!("Write error: {}", e))?;
-    stream
-        .write_all(&data)
-        .map_err(|e| format!("Write error: {}", e))?;
-
-    let mut length_buf = [0u8; 4];
-    stream
-        .read_exact(&mut length_buf)
-        .map_err(|e| format!("Read error: {}", e))?;
-    let response_len = u32::from_be_bytes(length_buf) as usize;
-
-    let mut response_buf = vec![0u8; response_len];
-    stream
-        .read_exact(&mut response_buf)
-        .map_err(|e| format!("Read error: {}", e))?;
-
-    serde_json::from_slice(&response_buf).map_err(|e| format!("JSON parse error: {}", e))
-}
-
 /// Get LFM2 daemon status
-pub async fn status() -> Result<Json<LFM2StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let request = serde_json::json!({
-        "command": "status"
-    });
+pub async fn status(
+    State(state): State<AppState>,
+) -> Result<Json<LFM2StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.read().await;
 
-    match send_daemon_request(request) {
+    match engine.get_lfm2_daemon_status() {
         Ok(response) => {
-            if let Some(error) = response.get("error").and_then(|e| e.as_str()) {
+            if let Some(error) = &response.error {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse {
                         error: ErrorDetail {
-                            message: error.to_string(),
+                            message: error.clone(),
                         },
                     }),
                 ));
             }
 
             Ok(Json(LFM2StatusResponse {
-                status: response
-                    .get("status")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("unknown")
-                    .to_string(),
-                device: response
-                    .get("device")
-                    .and_then(|d| d.as_str())
-                    .map(|s| s.to_string()),
-                cached_models: response
-                    .get("cached_models")
-                    .and_then(|c| c.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                voices: response
-                    .get("voices")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_else(|| {
-                        vec![
-                            "us_male".to_string(),
-                            "us_female".to_string(),
-                            "uk_male".to_string(),
-                            "uk_female".to_string(),
-                        ]
-                    }),
+                running: response.status.as_deref() == Some("ok"),
+                status: response.status.unwrap_or_else(|| "unknown".to_string()),
+                device: response.device,
+                cached_models: response.cached_models.unwrap_or_default(),
+                voices: response.voices.unwrap_or_else(|| {
+                    vec![
+                        "us_male".to_string(),
+                        "us_female".to_string(),
+                        "uk_male".to_string(),
+                        "uk_female".to_string(),
+                    ]
+                }),
             }))
         }
         Err(e) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
-                error: ErrorDetail { message: e },
+                error: ErrorDetail {
+                    message: format!("LFM2 daemon not available: {}", e),
+                },
+            }),
+        )),
+    }
+}
+
+/// Start the LFM2 daemon
+pub async fn start_daemon(
+    State(state): State<AppState>,
+) -> Result<Json<LFM2DaemonResponse>, (StatusCode, Json<LFM2DaemonResponse>)> {
+    info!("Starting LFM2 daemon via API");
+
+    let engine = state.engine.read().await;
+
+    match engine.ensure_lfm2_daemon_running() {
+        Ok(_) => Ok(Json(LFM2DaemonResponse {
+            success: true,
+            message: "LFM2 daemon started successfully".to_string(),
+        })),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(LFM2DaemonResponse {
+                success: false,
+                message: format!("Failed to start LFM2 daemon: {}", e),
+            }),
+        )),
+    }
+}
+
+/// Stop the LFM2 daemon
+pub async fn stop_daemon(
+    State(state): State<AppState>,
+) -> Result<Json<LFM2DaemonResponse>, (StatusCode, Json<LFM2DaemonResponse>)> {
+    info!("Stopping LFM2 daemon via API");
+
+    let engine = state.engine.read().await;
+
+    match engine.stop_lfm2_daemon() {
+        Ok(_) => Ok(Json(LFM2DaemonResponse {
+            success: true,
+            message: "LFM2 daemon stopped successfully".to_string(),
+        })),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(LFM2DaemonResponse {
+                success: false,
+                message: format!("Failed to stop LFM2 daemon: {}", e),
             }),
         )),
     }
@@ -194,6 +194,7 @@ pub async fn status() -> Result<Json<LFM2StatusResponse>, (StatusCode, Json<Erro
 
 /// Generate TTS with LFM2
 pub async fn tts(
+    State(state): State<AppState>,
     Json(req): Json<LFM2TTSRequest>,
 ) -> Result<Json<LFM2TTSResponse>, (StatusCode, Json<ErrorResponse>)> {
     info!(
@@ -202,56 +203,26 @@ pub async fn tts(
         req.voice
     );
 
-    let mut request = serde_json::json!({
-        "command": "tts",
-        "text": req.text,
-        "voice": req.voice,
-    });
+    let engine = state.engine.read().await;
 
-    if let Some(max_tokens) = req.max_new_tokens {
-        request["max_new_tokens"] = serde_json::json!(max_tokens);
-    }
-    if let Some(temp) = req.audio_temperature {
-        request["audio_temperature"] = serde_json::json!(temp);
-    }
-    if let Some(top_k) = req.audio_top_k {
-        request["audio_top_k"] = serde_json::json!(top_k);
-    }
-
-    match send_daemon_request(request) {
-        Ok(response) => {
-            if let Some(error) = response.get("error").and_then(|e| e.as_str()) {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: ErrorDetail {
-                            message: error.to_string(),
-                        },
-                    }),
-                ));
-            }
-
-            Ok(Json(LFM2TTSResponse {
-                audio_base64: response
-                    .get("audio_base64")
-                    .and_then(|a| a.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                sample_rate: response
-                    .get("sample_rate")
-                    .and_then(|s| s.as_u64())
-                    .unwrap_or(24000) as u32,
-                format: response
-                    .get("format")
-                    .and_then(|f| f.as_str())
-                    .unwrap_or("wav")
-                    .to_string(),
-            }))
-        }
+    match engine.lfm2_generate_tts(
+        &req.text,
+        Some(&req.voice),
+        req.max_new_tokens,
+        req.audio_temperature,
+        req.audio_top_k,
+    ) {
+        Ok(response) => Ok(Json(LFM2TTSResponse {
+            audio_base64: response.audio_base64.unwrap_or_default(),
+            sample_rate: response.sample_rate.unwrap_or(24000),
+            format: response.format.unwrap_or_else(|| "wav".to_string()),
+        })),
         Err(e) => Err((
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: ErrorDetail { message: e },
+                error: ErrorDetail {
+                    message: format!("{}", e),
+                },
             }),
         )),
     }
@@ -259,44 +230,23 @@ pub async fn tts(
 
 /// Transcribe audio with LFM2 ASR
 pub async fn asr(
+    State(state): State<AppState>,
     Json(req): Json<LFM2ASRRequest>,
 ) -> Result<Json<LFM2ASRResponse>, (StatusCode, Json<ErrorResponse>)> {
     info!("LFM2 ASR request");
 
-    let mut request = serde_json::json!({
-        "command": "asr",
-        "audio_base64": req.audio_base64,
-    });
+    let engine = state.engine.read().await;
 
-    if let Some(max_tokens) = req.max_new_tokens {
-        request["max_new_tokens"] = serde_json::json!(max_tokens);
-    }
-
-    match send_daemon_request(request) {
-        Ok(response) => {
-            if let Some(error) = response.get("error").and_then(|e| e.as_str()) {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: ErrorDetail {
-                            message: error.to_string(),
-                        },
-                    }),
-                ));
-            }
-
-            Ok(Json(LFM2ASRResponse {
-                transcription: response
-                    .get("transcription")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            }))
-        }
+    match engine.lfm2_transcribe(&req.audio_base64, req.max_new_tokens) {
+        Ok(response) => Ok(Json(LFM2ASRResponse {
+            transcription: response.transcription.unwrap_or_default(),
+        })),
         Err(e) => Err((
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: ErrorDetail { message: e },
+                error: ErrorDetail {
+                    message: format!("{}", e),
+                },
             }),
         )),
     }
@@ -304,68 +254,32 @@ pub async fn asr(
 
 /// Audio-to-audio chat with LFM2
 pub async fn chat(
+    State(state): State<AppState>,
     Json(req): Json<LFM2AudioChatRequest>,
 ) -> Result<Json<LFM2AudioChatResponse>, (StatusCode, Json<ErrorResponse>)> {
     info!("LFM2 Audio Chat request");
 
-    let mut request = serde_json::json!({
-        "command": "audio_chat",
-    });
+    let engine = state.engine.read().await;
 
-    if let Some(audio) = &req.audio_base64 {
-        request["audio_base64"] = serde_json::json!(audio);
-    }
-    if let Some(text) = &req.text {
-        request["text"] = serde_json::json!(text);
-    }
-    if let Some(max_tokens) = req.max_new_tokens {
-        request["max_new_tokens"] = serde_json::json!(max_tokens);
-    }
-    if let Some(temp) = req.audio_temperature {
-        request["audio_temperature"] = serde_json::json!(temp);
-    }
-    if let Some(top_k) = req.audio_top_k {
-        request["audio_top_k"] = serde_json::json!(top_k);
-    }
-
-    match send_daemon_request(request) {
-        Ok(response) => {
-            if let Some(error) = response.get("error").and_then(|e| e.as_str()) {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: ErrorDetail {
-                            message: error.to_string(),
-                        },
-                    }),
-                ));
-            }
-
-            Ok(Json(LFM2AudioChatResponse {
-                text: response
-                    .get("text")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                audio_base64: response
-                    .get("audio_base64")
-                    .and_then(|a| a.as_str())
-                    .map(|s| s.to_string()),
-                sample_rate: response
-                    .get("sample_rate")
-                    .and_then(|s| s.as_u64())
-                    .unwrap_or(24000) as u32,
-                format: response
-                    .get("format")
-                    .and_then(|f| f.as_str())
-                    .unwrap_or("wav")
-                    .to_string(),
-            }))
-        }
+    match engine.lfm2_audio_chat(
+        req.audio_base64.as_deref(),
+        req.text.as_deref(),
+        req.max_new_tokens,
+        req.audio_temperature,
+        req.audio_top_k,
+    ) {
+        Ok(response) => Ok(Json(LFM2AudioChatResponse {
+            text: response.text.unwrap_or_default(),
+            audio_base64: response.audio_base64,
+            sample_rate: response.sample_rate.unwrap_or(24000),
+            format: response.format.unwrap_or_else(|| "wav".to_string()),
+        })),
         Err(e) => Err((
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: ErrorDetail { message: e },
+                error: ErrorDetail {
+                    message: format!("{}", e),
+                },
             }),
         )),
     }

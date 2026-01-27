@@ -14,7 +14,9 @@ import clsx from "clsx";
 
 export function LFM2TTSPlayground() {
   const [text, setText] = useState("");
-  const [voice, setVoice] = useState<"us_male" | "us_female" | "uk_male" | "uk_female">("us_female");
+  const [voice, setVoice] = useState<
+    "us_male" | "us_female" | "uk_male" | "uk_female"
+  >("us_female");
   const [showVoiceSelect, setShowVoiceSelect] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -40,6 +42,7 @@ export function LFM2TTSPlayground() {
         setAudioUrl(null);
       }
 
+      // The daemon will be started automatically by the backend if needed
       const blob = await api.lfm2GenerateTTS({
         text: text.trim(),
         voice: voice,
@@ -113,7 +116,7 @@ export function LFM2TTSPlayground() {
             <ChevronDown
               className={clsx(
                 "w-3.5 h-3.5 text-gray-500 transition-transform",
-                showVoiceSelect && "rotate-180"
+                showVoiceSelect && "rotate-180",
               )}
             />
           </button>
@@ -135,7 +138,7 @@ export function LFM2TTSPlayground() {
                     }}
                     className={clsx(
                       "w-full px-3 py-2 rounded text-left transition-colors flex items-center gap-3",
-                      voice === v.id ? "bg-white/10" : "hover:bg-[#2a2a2a]"
+                      voice === v.id ? "bg-white/10" : "hover:bg-[#2a2a2a]",
                     )}
                   >
                     <div className="w-8 h-8 rounded-full bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center text-xs font-medium text-white flex-shrink-0">
@@ -145,7 +148,7 @@ export function LFM2TTSPlayground() {
                       <div
                         className={clsx(
                           "text-sm font-medium",
-                          voice === v.id ? "text-white" : "text-gray-300"
+                          voice === v.id ? "text-white" : "text-gray-300",
                         )}
                       >
                         {v.name}
@@ -178,7 +181,7 @@ export function LFM2TTSPlayground() {
             <span
               className={clsx(
                 "text-xs",
-                text.length > 500 ? "text-red-400" : "text-gray-600"
+                text.length > 500 ? "text-red-400" : "text-gray-600",
               )}
             >
               {text.length}
@@ -220,7 +223,7 @@ export function LFM2TTSPlayground() {
             disabled={generating}
             className={clsx(
               "btn flex-1",
-              generating ? "btn-secondary" : "btn-primary"
+              generating ? "btn-secondary" : "btn-primary",
             )}
           >
             {generating ? (

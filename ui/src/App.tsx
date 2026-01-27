@@ -153,7 +153,7 @@ function App() {
       "custom-voice": { total: 0, ready: 0 },
       "voice-clone": { total: 0, ready: 0 },
       "voice-design": { total: 0, ready: 0 },
-      "lfm2-audio": { total: 1, ready: 1 },
+      "lfm2-audio": { total: 0, ready: 0 },
     };
 
     models
@@ -389,7 +389,12 @@ function App() {
                   exit={{ opacity: 0, y: -10 }}
                   transition={{ duration: 0.2 }}
                 >
-                  <LFM2AudioPlayground />
+                  <LFM2AudioPlayground
+                    selectedModel={relevantSelectedModel}
+                    onModelRequired={() =>
+                      setError("Please load the LFM2-Audio model first")
+                    }
+                  />
                 </motion.div>
               )}
             </AnimatePresence>

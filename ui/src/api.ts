@@ -213,12 +213,21 @@ class ApiClient {
   }
 
   async lfm2Status(): Promise<{
+    running: boolean;
     status: string;
-    device: string;
+    device: string | null;
     cached_models: string[];
     voices: string[];
   }> {
     return this.request("/lfm2/status");
+  }
+
+  async lfm2StartDaemon(): Promise<{ success: boolean; message: string }> {
+    return this.request("/lfm2/start", { method: "POST" });
+  }
+
+  async lfm2StopDaemon(): Promise<{ success: boolean; message: string }> {
+    return this.request("/lfm2/stop", { method: "POST" });
   }
 }
 
