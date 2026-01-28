@@ -20,10 +20,11 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     label: "Text to Speech",
     description: "Generate speech with built-in voice profiles",
     icon: "Volume2",
-    modelFilter: (variant) => variant.includes("CustomVoice"),
-    emptyStateTitle: "No Custom Voice Model Loaded",
+    modelFilter: (variant) =>
+      variant.includes("CustomVoice") || variant.includes("LFM2-Audio"),
+    emptyStateTitle: "No TTS Model Loaded",
     emptyStateDescription:
-      "Load a CustomVoice model to generate speech with built-in voice profiles",
+      "Load a CustomVoice or LFM2-Audio model to generate speech",
   },
   "voice-clone": {
     id: "voice-clone",

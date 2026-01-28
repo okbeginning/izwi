@@ -122,10 +122,9 @@ class LFM2Daemon:
         try:
             import torch
 
-            if torch.cuda.is_available():
-                self.device = "cuda:0"
-                self.dtype = torch.bfloat16
-            elif torch.backends.mps.is_available():
+            # On macOS, never use CUDA even if PyTorch was compiled with CUDA support
+            # Check for MPS first (Apple Silicon), then CPU
+            if torch.backends.mps.is_available():
                 self.device = "mps"
                 self.dtype = torch.float32
             else:
@@ -136,6 +135,79 @@ class LFM2Daemon:
             self.device = "cpu"
             self.dtype = None
 
+    def _get_local_model_path(self) -> Optional[Path]:
+        """Get local model path if downloaded."""
+        # Check common locations for downloaded models
+        possible_paths = [
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "izwi"
+            / "models"
+            / "LFM2-Audio-1.5B",
+            Path.home() / ".cache" / "izwi" / "models" / "LFM2-Audio-1.5B",
+            Path.home() / ".local" / "share" / "izwi" / "models" / "LFM2-Audio-1.5B",
+        ]
+
+        for path in possible_paths:
+            if path.exists():
+                # Check for essential files
+                if (path / "model.safetensors").exists() and (
+                    path / "config.json"
+                ).exists():
+                    return path
+        return None
+
+    def _setup_hf_cache_symlink(self, local_path: Path) -> bool:
+        """
+        Create a symlink in the HuggingFace cache to point to our local model.
+        This allows liquid_audio's from_pretrained to find the model.
+        """
+        # HuggingFace cache structure: ~/.cache/huggingface/hub/models--{org}--{repo}/snapshots/{hash}/
+        hf_cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+        model_cache_dir = hf_cache_dir / "models--LiquidAI--LFM2-Audio-1.5B"
+        snapshots_dir = model_cache_dir / "snapshots"
+
+        # Create a fake snapshot directory
+        snapshot_hash = "local"
+        snapshot_dir = snapshots_dir / snapshot_hash
+
+        try:
+            # Create parent directories
+            snapshots_dir.mkdir(parents=True, exist_ok=True)
+
+            # Create refs/main to point to our snapshot
+            refs_dir = model_cache_dir / "refs"
+            refs_dir.mkdir(parents=True, exist_ok=True)
+            refs_main = refs_dir / "main"
+
+            # Write the snapshot hash to refs/main
+            with open(refs_main, "w") as f:
+                f.write(snapshot_hash)
+
+            # Create symlink or copy files to snapshot directory
+            if snapshot_dir.exists():
+                if snapshot_dir.is_symlink():
+                    snapshot_dir.unlink()
+                elif snapshot_dir.is_dir():
+                    import shutil
+
+                    shutil.rmtree(snapshot_dir)
+
+            # Create symlink to local model path
+            snapshot_dir.symlink_to(local_path)
+
+            print(
+                f"[LFM2 Daemon] Created HF cache symlink: {snapshot_dir} -> {local_path}",
+                file=sys.stderr,
+            )
+            return True
+        except Exception as e:
+            print(
+                f"[LFM2 Daemon] Failed to create HF cache symlink: {e}", file=sys.stderr
+            )
+            return False
+
     def _load_model(self, model_id: str = DEFAULT_HF_REPO) -> dict:
         """Load LFM2-Audio model and processor."""
         cached = self.model_cache.get(model_id)
@@ -143,16 +215,30 @@ class LFM2Daemon:
             print(f"[LFM2 Daemon] Using cached model: {model_id}", file=sys.stderr)
             return cached
 
+        # Check for local model path first
+        local_path = self._get_local_model_path()
+
+        if local_path:
+            # Set up HF cache symlink so liquid_audio can find the model
+            self._setup_hf_cache_symlink(local_path)
+            print(f"[LFM2 Daemon] Using local model at: {local_path}", file=sys.stderr)
+
+        # Always use the HF repo ID - the symlink will redirect to local files
         print(f"[LFM2 Daemon] Loading model: {model_id}", file=sys.stderr)
         start_time = time.time()
 
         import torch
         from liquid_audio import LFM2AudioModel, LFM2AudioProcessor
 
+        # Load model following the official documentation
+        print(f"[LFM2 Daemon] Loading processor...", file=sys.stderr)
         processor = LFM2AudioProcessor.from_pretrained(model_id).eval()
+        print(f"[LFM2 Daemon] Loading model...", file=sys.stderr)
         model = LFM2AudioModel.from_pretrained(model_id).eval()
 
-        if self.device == "cuda:0":
+        # Move to device if not CPU
+        if self.device != "cpu":
+            print(f"[LFM2 Daemon] Moving model to {self.device}...", file=sys.stderr)
             model = model.to(self.device)
 
         model_data = {
@@ -591,7 +677,9 @@ class LFM2Daemon:
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals."""
-        print(f"[LFM2 Daemon] Received signal {signum}, shutting down...", file=sys.stderr)
+        print(
+            f"[LFM2 Daemon] Received signal {signum}, shutting down...", file=sys.stderr
+        )
         self.running = False
 
 
@@ -600,8 +688,12 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="LFM2-Audio Daemon")
-    parser.add_argument("--socket", default=DEFAULT_SOCKET_PATH, help="Unix socket path")
-    parser.add_argument("--preload", action="store_true", help="Preload model on startup")
+    parser.add_argument(
+        "--socket", default=DEFAULT_SOCKET_PATH, help="Unix socket path"
+    )
+    parser.add_argument(
+        "--preload", action="store_true", help="Preload model on startup"
+    )
     parser.add_argument(
         "--model-id", default=DEFAULT_HF_REPO, help="HuggingFace model ID to use"
     )

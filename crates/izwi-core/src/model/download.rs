@@ -99,7 +99,15 @@ impl ModelDownloader {
             return false;
         }
 
-        // Check for essential files
+        // Check for essential files based on model type
+        if variant.is_lfm2() {
+            // LFM2-Audio requires model.safetensors, config.json, and tokenizer files
+            let has_model = path.join("model.safetensors").exists();
+            let has_config = path.join("config.json").exists();
+            let has_tokenizer = path.join("tokenizer.json").exists();
+            return has_model && has_config && has_tokenizer;
+        }
+
         if variant.is_tokenizer() {
             path.join("tokenizer.json").exists() || path.join("vocab.json").exists()
         } else {
@@ -230,8 +238,21 @@ impl ModelDownloader {
     }
 
     /// Get list of files to download for a model variant
-    /// Based on actual Qwen3-TTS repo structure on HuggingFace
+    /// Based on actual repo structure on HuggingFace
     fn get_model_files(&self, variant: ModelVariant) -> Vec<String> {
+        // LFM2-Audio has a different file structure
+        if variant.is_lfm2() {
+            return vec![
+                "config.json".to_string(),
+                "model.safetensors".to_string(),
+                "tokenizer.json".to_string(),
+                "tokenizer_config.json".to_string(),
+                "special_tokens_map.json".to_string(),
+                "tokenizer-e351c8d8-checkpoint125.safetensors".to_string(),
+                "chat_template.jinja".to_string(),
+            ];
+        }
+
         let mut files = vec![
             "config.json".to_string(),
             "generation_config.json".to_string(),
