@@ -6,6 +6,13 @@ Supports TTS, ASR, and Audio-to-Audio chat via Unix socket.
 
 import sys
 import os
+
+# CRITICAL: Disable CUDA before ANY torch imports to prevent
+# "Torch not compiled with CUDA enabled" errors on macOS.
+# This must happen at the very top, before torch is imported anywhere.
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 import io
 import json
 import signal
@@ -231,28 +238,11 @@ class LFM2Daemon:
         from liquid_audio import LFM2AudioModel, LFM2AudioProcessor
 
         # Load model following the official documentation
+        # Note: CUDA is disabled at module load via CUDA_VISIBLE_DEVICES=""
         print(f"[LFM2 Daemon] Loading processor...", file=sys.stderr)
-        try:
-            processor = LFM2AudioProcessor.from_pretrained(model_id).eval()
-            print(f"[LFM2 Daemon] Loading model...", file=sys.stderr)
-            model = LFM2AudioModel.from_pretrained(model_id).eval()
-        except Exception as e:
-            if "Torch not compiled with CUDA enabled" not in str(e):
-                raise
-            print(
-                "[LFM2 Daemon] CUDA not available; retrying model load on CPU",
-                file=sys.stderr,
-            )
-            self.device = "cpu"
-            self.dtype = torch.float32
-            os.environ["CUDA_VISIBLE_DEVICES"] = ""
-            try:
-                torch.set_default_device("cpu")
-            except Exception:
-                pass
-            processor = LFM2AudioProcessor.from_pretrained(model_id).eval()
-            print(f"[LFM2 Daemon] Loading model...", file=sys.stderr)
-            model = LFM2AudioModel.from_pretrained(model_id).eval()
+        processor = LFM2AudioProcessor.from_pretrained(model_id).eval()
+        print(f"[LFM2 Daemon] Loading model...", file=sys.stderr)
+        model = LFM2AudioModel.from_pretrained(model_id).eval()
 
         # Move to device if not CPU
         if self.device != "cpu":
