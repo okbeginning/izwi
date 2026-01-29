@@ -1,5 +1,6 @@
 //! API routes and handlers
 
+mod asr;
 mod daemon;
 mod health;
 mod lfm2;
@@ -40,7 +41,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/lfm2/stop", post(lfm2::stop_daemon))
         .route("/lfm2/tts", post(lfm2::tts))
         .route("/lfm2/asr", post(lfm2::asr))
-        .route("/lfm2/chat", post(lfm2::chat));
+        .route("/lfm2/chat", post(lfm2::chat))
+        // Qwen3-ASR endpoints
+        .route("/asr/status", get(asr::status))
+        .route("/asr/start", post(asr::start_daemon))
+        .route("/asr/stop", post(asr::stop_daemon))
+        .route("/asr/transcribe", post(asr::transcribe));
 
     Router::new()
         .nest("/api/v1", api_routes)

@@ -11,6 +11,28 @@ import {
 import { ModelInfo } from "../api";
 import clsx from "clsx";
 
+function parseSize(sizeStr: string): number {
+  const match = sizeStr.match(/^([\d.]+)\s*(GB|MB|KB|B)?$/i);
+  if (!match) return 0;
+  const value = parseFloat(match[1]);
+  const unit = (match[2] || "B").toUpperCase();
+  const multipliers: Record<string, number> = {
+    B: 1,
+    KB: 1024,
+    MB: 1024 * 1024,
+    GB: 1024 * 1024 * 1024,
+  };
+  return value * (multipliers[unit] || 1);
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024)
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
 interface ModelManagerProps {
   models: ModelInfo[];
   selectedModel: string | null;
@@ -81,6 +103,24 @@ const MODEL_DETAILS: Record<
       "End-to-end audio foundation model for TTS, ASR, and audio chat",
     features: ["TTS", "ASR", "Audio-to-audio chat", "4 voice styles"],
     size: "3.0 GB",
+  },
+  "Qwen3-ASR-0.6B": {
+    shortName: "ASR 0.6B",
+    fullName: "Qwen3-ASR 0.6B",
+    description: "Fast speech-to-text model supporting 52 languages",
+    features: ["52 languages", "Language detection", "Fast inference"],
+    size: "1.9 GB",
+  },
+  "Qwen3-ASR-1.7B": {
+    shortName: "ASR 1.7B",
+    fullName: "Qwen3-ASR 1.7B",
+    description: "High-quality speech-to-text model supporting 52 languages",
+    features: [
+      "52 languages",
+      "Language detection",
+      "State-of-the-art accuracy",
+    ],
+    size: "4.7 GB",
   },
 };
 
@@ -220,7 +260,8 @@ export function ModelManager({
                   </div>
                   <div className="text-xs text-gray-500 mt-0.5">
                     {details.size}
-                    {isDownloading && ` • ${progress.toFixed(0)}% downloaded`}
+                    {isDownloading &&
+                      ` • ${progress.toFixed(0)}% (${formatBytes((parseSize(details.size) * progress) / 100)} / ${details.size})`}
                     {isLoading && " • Loading..."}
                   </div>
                 </div>

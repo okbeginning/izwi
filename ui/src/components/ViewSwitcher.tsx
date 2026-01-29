@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import { Volume2, Users, Wand2, AudioWaveform } from "lucide-react";
+import { Volume2, Users, Wand2, AudioWaveform, FileText } from "lucide-react";
 import { ViewMode, VIEW_CONFIGS } from "../types";
 import clsx from "clsx";
 
@@ -14,6 +14,7 @@ const ICONS = {
   Users,
   Wand2,
   AudioWaveform,
+  FileText,
 };
 
 export function ViewSwitcher({
@@ -21,7 +22,7 @@ export function ViewSwitcher({
   onViewChange,
   modelCounts,
 }: ViewSwitcherProps) {
-  const views = Object.values(VIEW_CONFIGS);
+  const views = Object.values(VIEW_CONFIGS).filter((v) => !v.disabled);
 
   return (
     <div className="flex flex-col sm:flex-row gap-2 p-1 bg-[#0d0d0d] rounded-xl border border-[#2a2a2a]">

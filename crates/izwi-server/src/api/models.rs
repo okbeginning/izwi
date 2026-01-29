@@ -110,11 +110,23 @@ fn parse_variant(s: &str) -> Result<ModelVariant, ApiError> {
         "Qwen3-TTS-12Hz-1.7B-VoiceDesign" => return Ok(ModelVariant::Qwen3Tts12Hz17BVoiceDesign),
         "Qwen3-TTS-Tokenizer-12Hz" => return Ok(ModelVariant::Qwen3TtsTokenizer12Hz),
         "LFM2-Audio-1.5B" => return Ok(ModelVariant::Lfm2Audio15B),
+        "Qwen3-ASR-0.6B" => return Ok(ModelVariant::Qwen3Asr06B),
+        "Qwen3-ASR-1.7B" => return Ok(ModelVariant::Qwen3Asr17B),
         _ => {}
     }
 
     // Fallback: normalize and try pattern matching
     let normalized = s.to_lowercase().replace("-", "_").replace(".", "");
+
+    // Qwen3-ASR models (check before TTS to avoid conflicts)
+    if normalized.contains("qwen3") && normalized.contains("asr") {
+        if normalized.contains("06b") {
+            return Ok(ModelVariant::Qwen3Asr06B);
+        }
+        if normalized.contains("17b") {
+            return Ok(ModelVariant::Qwen3Asr17B);
+        }
+    }
 
     if normalized.contains("06b") && normalized.contains("base") && !normalized.contains("custom") {
         return Ok(ModelVariant::Qwen3Tts12Hz06BBase);
@@ -143,7 +155,7 @@ fn parse_variant(s: &str) -> Result<ModelVariant, ApiError> {
     }
 
     Err(ApiError::bad_request(format!(
-        "Unknown model variant: {}. Valid variants: Qwen3-TTS-12Hz-0.6B-Base, Qwen3-TTS-12Hz-0.6B-CustomVoice, Qwen3-TTS-12Hz-1.7B-Base, Qwen3-TTS-12Hz-1.7B-CustomVoice, Qwen3-TTS-12Hz-1.7B-VoiceDesign, Qwen3-TTS-Tokenizer-12Hz, LFM2-Audio-1.5B",
+        "Unknown model variant: {}. Valid variants: Qwen3-TTS-12Hz-0.6B-Base, Qwen3-TTS-12Hz-0.6B-CustomVoice, Qwen3-TTS-12Hz-1.7B-Base, Qwen3-TTS-12Hz-1.7B-CustomVoice, Qwen3-TTS-12Hz-1.7B-VoiceDesign, Qwen3-TTS-Tokenizer-12Hz, LFM2-Audio-1.5B, Qwen3-ASR-0.6B, Qwen3-ASR-1.7B",
         s
     )))
 }

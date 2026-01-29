@@ -2,7 +2,8 @@ export type ViewMode =
   | "custom-voice"
   | "voice-clone"
   | "voice-design"
-  | "lfm2-audio";
+  | "lfm2-audio"
+  | "transcription";
 
 export interface ViewConfig {
   id: ViewMode;
@@ -12,6 +13,7 @@ export interface ViewConfig {
   modelFilter: (variant: string) => boolean;
   emptyStateTitle: string;
   emptyStateDescription: string;
+  disabled?: boolean;
 }
 
 export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
@@ -20,11 +22,9 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     label: "Text to Speech",
     description: "Generate speech with built-in voice profiles",
     icon: "Volume2",
-    modelFilter: (variant) =>
-      variant.includes("CustomVoice") || variant.includes("LFM2-Audio"),
+    modelFilter: (variant) => variant.includes("CustomVoice"),
     emptyStateTitle: "No TTS Model Loaded",
-    emptyStateDescription:
-      "Load a CustomVoice or LFM2-Audio model to generate speech",
+    emptyStateDescription: "Load a CustomVoice model to generate speech",
   },
   "voice-clone": {
     id: "voice-clone",
@@ -56,6 +56,17 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     emptyStateTitle: "No LFM2-Audio Model Loaded",
     emptyStateDescription:
       "Download and load the LFM2-Audio model for TTS, ASR, and audio chat",
+    disabled: true,
+  },
+  transcription: {
+    id: "transcription",
+    label: "Transcription",
+    description: "Speech-to-text with Qwen3-ASR",
+    icon: "FileText",
+    modelFilter: (variant) => variant.includes("Qwen3-ASR"),
+    emptyStateTitle: "No ASR Model Loaded",
+    emptyStateDescription:
+      "Download and load a Qwen3-ASR model for speech transcription",
   },
 };
 

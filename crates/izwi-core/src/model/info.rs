@@ -27,6 +27,12 @@ pub enum ModelVariant {
     /// LFM2-Audio 1.5B model from Liquid AI
     #[serde(rename = "LFM2-Audio-1.5B")]
     Lfm2Audio15B,
+    /// Qwen3-ASR 0.6B model
+    #[serde(rename = "Qwen3-ASR-0.6B")]
+    Qwen3Asr06B,
+    /// Qwen3-ASR 1.7B model
+    #[serde(rename = "Qwen3-ASR-1.7B")]
+    Qwen3Asr17B,
 }
 
 impl ModelVariant {
@@ -40,6 +46,8 @@ impl ModelVariant {
             Self::Qwen3Tts12Hz17BVoiceDesign => "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
             Self::Qwen3TtsTokenizer12Hz => "Qwen/Qwen3-TTS-Tokenizer-12Hz",
             Self::Lfm2Audio15B => "LiquidAI/LFM2-Audio-1.5B",
+            Self::Qwen3Asr06B => "Qwen/Qwen3-ASR-0.6B",
+            Self::Qwen3Asr17B => "Qwen/Qwen3-ASR-1.7B",
         }
     }
 
@@ -53,6 +61,8 @@ impl ModelVariant {
             Self::Qwen3Tts12Hz17BVoiceDesign => "Qwen3-TTS 1.7B VoiceDesign",
             Self::Qwen3TtsTokenizer12Hz => "Qwen3-TTS Tokenizer 12Hz",
             Self::Lfm2Audio15B => "LFM2-Audio 1.5B",
+            Self::Qwen3Asr06B => "Qwen3-ASR 0.6B",
+            Self::Qwen3Asr17B => "Qwen3-ASR 1.7B",
         }
     }
 
@@ -66,6 +76,8 @@ impl ModelVariant {
             Self::Qwen3Tts12Hz17BVoiceDesign => "Qwen3-TTS-12Hz-1.7B-VoiceDesign",
             Self::Qwen3TtsTokenizer12Hz => "Qwen3-TTS-Tokenizer-12Hz",
             Self::Lfm2Audio15B => "LFM2-Audio-1.5B",
+            Self::Qwen3Asr06B => "Qwen3-ASR-0.6B",
+            Self::Qwen3Asr17B => "Qwen3-ASR-1.7B",
         }
     }
 
@@ -79,6 +91,8 @@ impl ModelVariant {
             Self::Qwen3Tts12Hz17BVoiceDesign => 3_400_000_000,
             Self::Qwen3TtsTokenizer12Hz => 500_000_000, // ~500MB
             Self::Lfm2Audio15B => 3_000_000_000,        // ~3GB
+            Self::Qwen3Asr06B => 1_900_000_000,         // ~1.9GB
+            Self::Qwen3Asr17B => 4_700_000_000,         // ~4.7GB
         }
     }
 
@@ -91,6 +105,8 @@ impl ModelVariant {
             | Self::Qwen3Tts12Hz17BVoiceDesign => 6.0,
             Self::Qwen3TtsTokenizer12Hz => 1.0,
             Self::Lfm2Audio15B => 6.0,
+            Self::Qwen3Asr06B => 2.5,
+            Self::Qwen3Asr17B => 6.0,
         }
     }
 
@@ -104,6 +120,11 @@ impl ModelVariant {
         matches!(self, Self::Lfm2Audio15B)
     }
 
+    /// Whether this is a Qwen3-ASR model
+    pub fn is_asr(&self) -> bool {
+        matches!(self, Self::Qwen3Asr06B | Self::Qwen3Asr17B)
+    }
+
     /// Get all available variants
     pub fn all() -> &'static [ModelVariant] {
         &[
@@ -114,6 +135,8 @@ impl ModelVariant {
             Self::Qwen3Tts12Hz17BVoiceDesign,
             Self::Qwen3TtsTokenizer12Hz,
             Self::Lfm2Audio15B,
+            Self::Qwen3Asr06B,
+            Self::Qwen3Asr17B,
         ]
     }
 }

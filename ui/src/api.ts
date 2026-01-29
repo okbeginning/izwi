@@ -81,6 +81,24 @@ export interface LFM2AudioChatResponse {
   format: string;
 }
 
+export interface ASRTranscribeRequest {
+  audio_base64: string;
+  model_id?: string;
+  language?: string;
+}
+
+export interface ASRTranscribeResponse {
+  transcription: string;
+  language: string | null;
+}
+
+export interface ASRStatusResponse {
+  running: boolean;
+  status: string;
+  device: string | null;
+  cached_models: string[];
+}
+
 class ApiClient {
   private baseUrl: string;
 
@@ -228,6 +246,27 @@ class ApiClient {
 
   async lfm2StopDaemon(): Promise<{ success: boolean; message: string }> {
     return this.request("/lfm2/stop", { method: "POST" });
+  }
+
+  async asrStatus(): Promise<ASRStatusResponse> {
+    return this.request("/asr/status");
+  }
+
+  async asrStartDaemon(): Promise<{ success: boolean; message: string }> {
+    return this.request("/asr/start", { method: "POST" });
+  }
+
+  async asrStopDaemon(): Promise<{ success: boolean; message: string }> {
+    return this.request("/asr/stop", { method: "POST" });
+  }
+
+  async asrTranscribe(
+    request: ASRTranscribeRequest,
+  ): Promise<ASRTranscribeResponse> {
+    return this.request("/asr/transcribe", {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
   }
 }
 

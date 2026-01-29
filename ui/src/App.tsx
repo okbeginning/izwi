@@ -7,6 +7,7 @@ import { TTSPlaygroundWrapper } from "./components/TTSPlaygroundWrapper";
 import { VoiceClonePlayground } from "./components/VoiceClonePlayground";
 import { VoiceDesignPlayground } from "./components/VoiceDesignPlayground";
 import { LFM2AudioPlayground } from "./components/LFM2AudioPlayground";
+import { TranscriptionPlayground } from "./components/TranscriptionPlayground";
 import { api, ModelInfo } from "./api";
 import { ViewMode, VIEW_CONFIGS } from "./types";
 
@@ -154,6 +155,7 @@ function App() {
       "voice-clone": { total: 0, ready: 0 },
       "voice-design": { total: 0, ready: 0 },
       "lfm2-audio": { total: 0, ready: 0 },
+      transcription: { total: 0, ready: 0 },
     };
 
     models
@@ -393,6 +395,23 @@ function App() {
                     selectedModel={relevantSelectedModel}
                     onModelRequired={() =>
                       setError("Please load the LFM2-Audio model first")
+                    }
+                  />
+                </motion.div>
+              )}
+
+              {currentView === "transcription" && (
+                <motion.div
+                  key="transcription"
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -10 }}
+                  transition={{ duration: 0.2 }}
+                >
+                  <TranscriptionPlayground
+                    selectedModel={relevantSelectedModel}
+                    onModelRequired={() =>
+                      setError("Please load a Qwen3-ASR model first")
                     }
                   />
                 </motion.div>

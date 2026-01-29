@@ -22,6 +22,8 @@ pub struct DownloadProgress {
     pub total_bytes: u64,
     pub progress_percent: f32,
     pub current_file: Option<String>,
+    pub files_completed: usize,
+    pub files_total: usize,
 }
 
 /// Model downloader for HuggingFace Hub
@@ -106,6 +108,15 @@ impl ModelDownloader {
             let has_config = path.join("config.json").exists();
             let has_tokenizer = path.join("tokenizer.json").exists();
             return has_model && has_config && has_tokenizer;
+        }
+
+        if variant.is_asr() {
+            // Qwen3-ASR requires config.json, vocab.json, and model weights
+            let has_config = path.join("config.json").exists();
+            let has_vocab = path.join("vocab.json").exists();
+            let has_model = path.join("model.safetensors").exists()
+                || path.join("model-00001-of-00002.safetensors").exists();
+            return has_config && has_vocab && has_model;
         }
 
         if variant.is_tokenizer() {
@@ -194,13 +205,24 @@ impl ModelDownloader {
         let files = self.get_model_files(variant);
         let total_files = files.len();
 
+        let file_sizes = self.get_file_sizes(variant);
+        let total_bytes: u64 = file_sizes.iter().sum();
+        let mut downloaded_bytes: u64 = 0;
+
         for (idx, file) in files.iter().enumerate() {
+            let file_size = file_sizes.get(idx).copied().unwrap_or(0);
             let progress = DownloadProgress {
                 variant,
-                downloaded_bytes: 0,
-                total_bytes: variant.estimated_size(),
-                progress_percent: (idx as f32 / total_files as f32) * 100.0,
+                downloaded_bytes,
+                total_bytes,
+                progress_percent: if total_bytes > 0 {
+                    (downloaded_bytes as f32 / total_bytes as f32) * 100.0
+                } else {
+                    (idx as f32 / total_files as f32) * 100.0
+                },
                 current_file: Some(file.clone()),
+                files_completed: idx,
+                files_total: total_files,
             };
             let _ = progress_tx.send(progress).await;
 
@@ -209,6 +231,7 @@ impl ModelDownloader {
             // Skip if already downloaded
             if dest.exists() {
                 debug!("File already exists: {:?}", dest);
+                downloaded_bytes += file_size;
                 continue;
             }
 
@@ -216,6 +239,7 @@ impl ModelDownloader {
             match self.download_file_http(repo_id, file, &dest) {
                 Ok(()) => {
                     debug!("Downloaded: {} -> {:?}", file, dest);
+                    downloaded_bytes += file_size;
                 }
                 Err(e) => {
                     warn!("Failed to download {}: {}", file, e);
@@ -226,10 +250,12 @@ impl ModelDownloader {
         // Send completion
         let progress = DownloadProgress {
             variant,
-            downloaded_bytes: variant.estimated_size(),
-            total_bytes: variant.estimated_size(),
+            downloaded_bytes: total_bytes,
+            total_bytes,
             progress_percent: 100.0,
             current_file: None,
+            files_completed: total_files,
+            files_total: total_files,
         };
         let _ = progress_tx.send(progress).await;
 
@@ -251,6 +277,29 @@ impl ModelDownloader {
                 "tokenizer-e351c8d8-checkpoint125.safetensors".to_string(),
                 "chat_template.jinja".to_string(),
             ];
+        }
+
+        // Qwen3-ASR models
+        if variant.is_asr() {
+            let mut files = vec![
+                "config.json".to_string(),
+                "generation_config.json".to_string(),
+                "merges.txt".to_string(),
+                "preprocessor_config.json".to_string(),
+                "tokenizer_config.json".to_string(),
+                "vocab.json".to_string(),
+            ];
+            // 0.6B has single model file, 1.7B has sharded weights
+            if matches!(variant, ModelVariant::Qwen3Asr06B) {
+                files.push("model.safetensors".to_string());
+            } else {
+                files.extend([
+                    "model-00001-of-00002.safetensors".to_string(),
+                    "model-00002-of-00002.safetensors".to_string(),
+                    "model.safetensors.index.json".to_string(),
+                ]);
+            }
+            return files;
         }
 
         let mut files = vec![
@@ -302,6 +351,48 @@ impl ModelDownloader {
         }
 
         files
+    }
+
+    /// Get estimated file sizes for a model variant (in bytes)
+    /// These are approximate sizes based on model architecture
+    fn get_file_sizes(&self, variant: ModelVariant) -> Vec<u64> {
+        let files = self.get_model_files(variant);
+        files
+            .iter()
+            .map(|file| {
+                // Estimate file sizes based on filename patterns
+                if file.contains("model.safetensors") && !file.contains("index") {
+                    if file.contains("00001") || file.contains("00002") {
+                        // Sharded model files ~2GB each
+                        2_000_000_000
+                    } else {
+                        // Single model file - varies by model
+                        match variant {
+                            ModelVariant::Qwen3Tts12Hz06BBase
+                            | ModelVariant::Qwen3Tts12Hz06BCustomVoice => 1_100_000_000,
+                            ModelVariant::Qwen3Asr06B => 1_800_000_000,
+                            ModelVariant::Lfm2Audio15B => 2_900_000_000,
+                            _ => 1_500_000_000,
+                        }
+                    }
+                } else if file.contains("tokenizer") && file.contains("safetensors") {
+                    // Tokenizer model ~300MB
+                    300_000_000
+                } else if file.contains("speech_tokenizer") && file.contains("safetensors") {
+                    // Speech tokenizer ~100MB
+                    100_000_000
+                } else if file.ends_with(".json")
+                    || file.ends_with(".txt")
+                    || file.ends_with(".jinja")
+                {
+                    // Config/text files are small
+                    100_000
+                } else {
+                    // Default for unknown files
+                    10_000_000
+                }
+            })
+            .collect()
     }
 
     /// Get download size for a model (if available from cache)
