@@ -140,7 +140,17 @@ export function ModelManager({
   const [expandedModel, setExpandedModel] = useState<string | null>(null);
   const ttsModels = models
     .filter((m) => !m.variant.includes("Tokenizer"))
-    .filter((m) => (modelFilter ? modelFilter(m.variant) : true));
+    .filter((m) => (modelFilter ? modelFilter(m.variant) : true))
+    .sort((a, b) => {
+      // Sort by size (smallest to largest)
+      const sizeA = parseSize(MODEL_DETAILS[a.variant]?.size || "0");
+      const sizeB = parseSize(MODEL_DETAILS[b.variant]?.size || "0");
+      if (sizeA !== sizeB) {
+        return sizeA - sizeB;
+      }
+      // If sizes are equal, sort by name
+      return a.variant.localeCompare(b.variant);
+    });
 
   if (ttsModels.length === 0) {
     return (
