@@ -41,11 +41,21 @@ function App() {
       setLoading(false);
     };
     init();
+  }, []);
 
-    // Poll for model status updates
-    const interval = setInterval(loadModels, 5000);
+  // Smart polling: only poll when there are active operations
+  useEffect(() => {
+    const hasActiveOperations = models.some(
+      (m) => m.status === "downloading" || m.status === "loading",
+    );
+
+    if (!hasActiveOperations) {
+      return;
+    }
+
+    const interval = setInterval(loadModels, 2000);
     return () => clearInterval(interval);
-  }, [loadModels]);
+  }, [models, loadModels]);
 
   const handleDownload = async (variant: string) => {
     try {
@@ -75,6 +85,7 @@ function App() {
       clearInterval(progressInterval);
       setDownloadProgress((prev) => ({ ...prev, [variant]: 100 }));
 
+      // Refresh models after download completes
       await loadModels();
 
       // Clear progress after a delay
@@ -100,6 +111,7 @@ function App() {
       );
 
       await api.loadModel(variant);
+      // Refresh models after load completes
       await loadModels();
       setSelectedModel(variant);
     } catch (err) {
@@ -112,18 +124,21 @@ function App() {
   const handleUnload = async (variant: string) => {
     try {
       await api.unloadModel(variant);
+      // Refresh models after unload
       await loadModels();
       if (selectedModel === variant) {
         setSelectedModel(null);
       }
     } catch (err) {
       console.error("Unload failed:", err);
+      setError("Failed to unload model. Please try again.");
     }
   };
 
   const handleDelete = async (variant: string) => {
     try {
       await api.deleteModel(variant);
+      // Refresh models after delete
       await loadModels();
       if (selectedModel === variant) {
         setSelectedModel(null);
@@ -147,6 +162,7 @@ function App() {
     onDelete: handleDelete,
     onSelect: setSelectedModel,
     onError: setError,
+    onRefresh: loadModels,
   };
 
   return (
@@ -188,6 +204,7 @@ function App() {
                 onLoad={handleLoad}
                 onUnload={handleUnload}
                 onDelete={handleDelete}
+                onRefresh={loadModels}
               />
             }
           />

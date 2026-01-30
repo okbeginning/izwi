@@ -12,6 +12,7 @@ import {
   Loader2,
   Check,
   X,
+  RefreshCw,
 } from "lucide-react";
 import { ModelInfo } from "../api";
 import clsx from "clsx";
@@ -24,6 +25,7 @@ interface MyModelsPageProps {
   onLoad: (variant: string) => void;
   onUnload: (variant: string) => void;
   onDelete: (variant: string) => void;
+  onRefresh?: () => void;
 }
 
 type FilterType = "all" | "downloaded" | "loaded" | "not_downloaded";
@@ -123,7 +125,8 @@ function parseSize(sizeStr: string): number {
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes < 1024 * 1024 * 1024)
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
@@ -170,12 +173,14 @@ export function MyModelsPage({
   onLoad,
   onUnload,
   onDelete,
+  onRefresh,
 }: MyModelsPageProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<FilterType>("all");
   const [categoryFilter, setCategoryFilter] = useState<CategoryType>("all");
   const [showFilters, setShowFilters] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
   const filteredModels = useMemo(() => {
     return models
@@ -197,9 +202,14 @@ export function MyModelsPage({
 
         // Status filter
         if (statusFilter !== "all") {
-          if (statusFilter === "downloaded" && m.status !== "downloaded") return false;
+          if (statusFilter === "downloaded" && m.status !== "downloaded")
+            return false;
           if (statusFilter === "loaded" && m.status !== "ready") return false;
-          if (statusFilter === "not_downloaded" && m.status !== "not_downloaded") return false;
+          if (
+            statusFilter === "not_downloaded" &&
+            m.status !== "not_downloaded"
+          )
+            return false;
         }
 
         // Category filter
@@ -211,7 +221,14 @@ export function MyModelsPage({
       })
       .sort((a, b) => {
         // Sort: loaded first, then downloaded, then not downloaded
-        const statusOrder = { ready: 0, loading: 1, downloaded: 2, downloading: 3, not_downloaded: 4, error: 5 };
+        const statusOrder = {
+          ready: 0,
+          loading: 1,
+          downloaded: 2,
+          downloading: 3,
+          not_downloaded: 4,
+          error: 5,
+        };
         const statusDiff = statusOrder[a.status] - statusOrder[b.status];
         if (statusDiff !== 0) return statusDiff;
 
@@ -223,14 +240,21 @@ export function MyModelsPage({
   }, [models, searchQuery, statusFilter, categoryFilter]);
 
   const stats = useMemo(() => {
-    const visibleModels = models.filter((m) => !m.variant.includes("Tokenizer") && MODEL_DETAILS[m.variant]);
+    const visibleModels = models.filter(
+      (m) => !m.variant.includes("Tokenizer") && MODEL_DETAILS[m.variant],
+    );
     return {
       total: visibleModels.length,
       loaded: visibleModels.filter((m) => m.status === "ready").length,
-      downloaded: visibleModels.filter((m) => m.status === "downloaded" || m.status === "ready").length,
+      downloaded: visibleModels.filter(
+        (m) => m.status === "downloaded" || m.status === "ready",
+      ).length,
       totalSize: visibleModels
         .filter((m) => m.status === "downloaded" || m.status === "ready")
-        .reduce((acc, m) => acc + parseSize(MODEL_DETAILS[m.variant]?.size || "0"), 0),
+        .reduce(
+          (acc, m) => acc + parseSize(MODEL_DETAILS[m.variant]?.size || "0"),
+          0,
+        ),
     };
   }, [models]);
 
@@ -265,12 +289,33 @@ export function MyModelsPage({
           </p>
         </div>
 
-        {/* Stats */}
+        {/* Stats and Refresh */}
         <div className="flex items-center gap-4">
+          {onRefresh && (
+            <button
+              onClick={async () => {
+                setIsRefreshing(true);
+                await onRefresh();
+                setIsRefreshing(false);
+              }}
+              disabled={isRefreshing}
+              className="p-2 rounded-lg bg-[#161616] border border-[#2a2a2a] hover:bg-[#1f1f1f] transition-colors disabled:opacity-50"
+              title="Refresh models"
+            >
+              <RefreshCw
+                className={clsx(
+                  "w-4 h-4 text-gray-400",
+                  isRefreshing && "animate-spin",
+                )}
+              />
+            </button>
+          )}
           <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-[#161616] border border-[#2a2a2a]">
             <HardDrive className="w-4 h-4 text-gray-500" />
             <div className="text-sm">
-              <span className="text-white font-medium">{formatBytes(stats.totalSize)}</span>
+              <span className="text-white font-medium">
+                {formatBytes(stats.totalSize)}
+              </span>
               <span className="text-gray-500 ml-1">used</span>
             </div>
           </div>
@@ -303,7 +348,7 @@ export function MyModelsPage({
             "flex items-center gap-2 px-4 py-2.5 rounded-lg border text-sm transition-colors",
             showFilters
               ? "bg-[#1a1a1a] border-[#404040] text-white"
-              : "bg-[#161616] border-[#2a2a2a] text-gray-400 hover:text-white"
+              : "bg-[#161616] border-[#2a2a2a] text-gray-400 hover:text-white",
           )}
         >
           <Filter className="w-4 h-4" />
@@ -312,7 +357,10 @@ export function MyModelsPage({
             <span className="w-1.5 h-1.5 rounded-full bg-white" />
           )}
           <ChevronDown
-            className={clsx("w-3.5 h-3.5 transition-transform", showFilters && "rotate-180")}
+            className={clsx(
+              "w-3.5 h-3.5 transition-transform",
+              showFilters && "rotate-180",
+            )}
           />
         </button>
       </div>
@@ -330,13 +378,18 @@ export function MyModelsPage({
               <div className="flex flex-wrap gap-6">
                 {/* Status filter */}
                 <div>
-                  <label className="block text-xs text-gray-500 mb-2">Status</label>
+                  <label className="block text-xs text-gray-500 mb-2">
+                    Status
+                  </label>
                   <div className="flex gap-2">
                     {[
                       { id: "all" as FilterType, label: "All" },
                       { id: "loaded" as FilterType, label: "Loaded" },
                       { id: "downloaded" as FilterType, label: "Downloaded" },
-                      { id: "not_downloaded" as FilterType, label: "Not Downloaded" },
+                      {
+                        id: "not_downloaded" as FilterType,
+                        label: "Not Downloaded",
+                      },
                     ].map((option) => (
                       <button
                         key={option.id}
@@ -345,7 +398,7 @@ export function MyModelsPage({
                           "px-3 py-1.5 rounded text-xs transition-colors",
                           statusFilter === option.id
                             ? "bg-white text-black"
-                            : "bg-[#1f1f1f] text-gray-400 hover:text-white"
+                            : "bg-[#1f1f1f] text-gray-400 hover:text-white",
                         )}
                       >
                         {option.label}
@@ -356,7 +409,9 @@ export function MyModelsPage({
 
                 {/* Category filter */}
                 <div>
-                  <label className="block text-xs text-gray-500 mb-2">Category</label>
+                  <label className="block text-xs text-gray-500 mb-2">
+                    Category
+                  </label>
                   <div className="flex gap-2">
                     {[
                       { id: "all" as CategoryType, label: "All" },
@@ -370,7 +425,7 @@ export function MyModelsPage({
                           "px-3 py-1.5 rounded text-xs transition-colors",
                           categoryFilter === option.id
                             ? "bg-white text-black"
-                            : "bg-[#1f1f1f] text-gray-400 hover:text-white"
+                            : "bg-[#1f1f1f] text-gray-400 hover:text-white",
                         )}
                       >
                         {option.label}
@@ -390,7 +445,9 @@ export function MyModelsPage({
           <div className="w-16 h-16 rounded-full bg-[#161616] flex items-center justify-center mb-4">
             <HardDrive className="w-7 h-7 text-gray-600" />
           </div>
-          <h3 className="text-base font-medium text-gray-300 mb-1">No models found</h3>
+          <h3 className="text-base font-medium text-gray-300 mb-1">
+            No models found
+          </h3>
           <p className="text-sm text-gray-600 max-w-xs">
             {searchQuery || statusFilter !== "all" || categoryFilter !== "all"
               ? "Try adjusting your search or filters"
@@ -407,7 +464,8 @@ export function MyModelsPage({
             const isLoading = model.status === "loading";
             const isReady = model.status === "ready";
             const isDownloaded = model.status === "downloaded";
-            const progress = downloadProgress[model.variant] || model.download_progress || 0;
+            const progress =
+              downloadProgress[model.variant] || model.download_progress || 0;
 
             return (
               <div
@@ -420,28 +478,37 @@ export function MyModelsPage({
                     {isDownloading || isLoading ? (
                       <Loader2 className="w-5 h-5 text-white animate-spin" />
                     ) : (
-                      <div className={clsx("w-2.5 h-2.5 rounded-full", getStatusColor(model.status))} />
+                      <div
+                        className={clsx(
+                          "w-2.5 h-2.5 rounded-full",
+                          getStatusColor(model.status),
+                        )}
+                      />
                     )}
                   </div>
 
                   {/* Model info */}
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 mb-1">
-                      <h3 className="text-sm font-medium text-white">{details.shortName}</h3>
+                      <h3 className="text-sm font-medium text-white">
+                        {details.shortName}
+                      </h3>
                       <span
                         className={clsx(
                           "text-[10px] px-1.5 py-0.5 rounded",
                           isReady
                             ? "bg-green-500/20 text-green-400"
                             : isDownloaded
-                            ? "bg-blue-500/20 text-blue-400"
-                            : "bg-gray-500/20 text-gray-500"
+                              ? "bg-blue-500/20 text-blue-400"
+                              : "bg-gray-500/20 text-gray-500",
                         )}
                       >
                         {getStatusLabel(model.status)}
                       </span>
                     </div>
-                    <p className="text-xs text-gray-500 mb-2">{details.description}</p>
+                    <p className="text-xs text-gray-500 mb-2">
+                      {details.description}
+                    </p>
 
                     {/* Capabilities */}
                     <div className="flex items-center gap-4">
@@ -455,7 +522,9 @@ export function MyModelsPage({
                           </span>
                         ))}
                       </div>
-                      <span className="text-xs text-gray-600">{details.size}</span>
+                      <span className="text-xs text-gray-600">
+                        {details.size}
+                      </span>
                     </div>
 
                     {/* Download progress */}
