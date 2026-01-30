@@ -101,14 +101,56 @@ body {
   @apply bg-red-500;
 }
 
-/* Custom audio player */
-audio::-webkit-media-controls-panel {
-  background: rgba(255, 255, 255, 0.05);
+/* Custom audio player - dark theme styling */
+audio {
+  border-radius: 8px;
+  width: 100%;
 }
 
+/* Make the entire audio player dark themed */
+audio::-webkit-media-controls-enclosure {
+  background-color: #1f1f1f;
+  border-radius: 8px;
+}
+
+audio::-webkit-media-controls-panel {
+  background-color: #1f1f1f;
+  padding: 8px 12px;
+}
+
+/* Play/pause and mute buttons - make them white for dark background */
 audio::-webkit-media-controls-play-button,
+audio::-webkit-media-controls-pause-button,
 audio::-webkit-media-controls-mute-button {
   filter: invert(1);
+  opacity: 0.85;
+  cursor: pointer;
+}
+
+audio::-webkit-media-controls-play-button:hover,
+audio::-webkit-media-controls-pause-button:hover,
+audio::-webkit-media-controls-mute-button:hover {
+  opacity: 1;
+}
+
+/* Timeline/progress bar */
+audio::-webkit-media-controls-timeline {
+  filter: invert(1);
+  opacity: 0.7;
+}
+
+/* Volume slider */
+audio::-webkit-media-controls-volume-slider {
+  filter: invert(1);
+  opacity: 0.7;
+}
+
+/* Time displays - white text for dark background */
+audio::-webkit-media-controls-current-time-display,
+audio::-webkit-media-controls-time-remaining-display {
+  color: #ffffff;
+  text-shadow: none;
+  font-weight: 500;
 }
 
 
