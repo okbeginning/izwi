@@ -488,7 +488,7 @@ export function MyModelsPage({
                   </div>
 
                   {/* Model info - more horizontal layout */}
-                  <div className="flex-1 min-w-0 flex items-center gap-4">
+                  <div className="flex-1 min-w-0 flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4">
                     <div className="flex items-center gap-2 min-w-0">
                       <h3 className="text-sm font-medium text-white truncate">
                         {details.shortName}
@@ -506,10 +506,10 @@ export function MyModelsPage({
                         {getStatusLabel(model.status)}
                       </span>
                     </div>
-                    <p className="text-xs text-gray-500 truncate hidden sm:block">
+                    <p className="text-xs text-gray-500 truncate hidden md:block">
                       {details.description}
                     </p>
-                    <div className="flex items-center gap-3 ml-auto">
+                    <div className="flex items-center gap-3 sm:ml-auto">
                       <div className="flex items-center gap-1.5">
                         {details.capabilities.map((cap) => (
                           <span

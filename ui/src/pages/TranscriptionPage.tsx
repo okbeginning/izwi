@@ -37,7 +37,7 @@ export function TranscriptionPage({
       return selectedModel;
     }
     const readyModel = models.find(
-      (m) => m.status === "ready" && viewConfig.modelFilter(m.variant)
+      (m) => m.status === "ready" && viewConfig.modelFilter(m.variant),
     );
     return readyModel?.variant || null;
   })();
@@ -51,9 +51,9 @@ export function TranscriptionPage({
         </p>
       </div>
 
-      <div className="grid lg:grid-cols-[320px,1fr] gap-6">
+      <div className="grid lg:grid-cols-[320px,1fr] gap-4 lg:gap-6">
         {/* Models sidebar */}
-        <div className="card p-4">
+        <div className="card p-3 lg:p-4">
           <div className="mb-3">
             <h2 className="text-sm font-medium text-white">Models</h2>
             <p className="text-xs text-gray-500 mt-0.5">Qwen3-ASR compatible</p>
@@ -89,7 +89,9 @@ export function TranscriptionPage({
         <div>
           <TranscriptionPlayground
             selectedModel={relevantSelectedModel}
-            onModelRequired={() => onError("Please load a Qwen3-ASR model first")}
+            onModelRequired={() =>
+              onError("Please load a Qwen3-ASR model first")
+            }
           />
         </div>
       </div>

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -10,6 +11,7 @@ import {
   Waves,
   AlertCircle,
   X,
+  Menu,
 } from "lucide-react";
 import clsx from "clsx";
 
@@ -73,12 +75,54 @@ export function Layout({
   onErrorDismiss,
   readyModelsCount,
 }: LayoutProps) {
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
   return (
     <div className="min-h-screen flex bg-[#0d0d0d]">
+      {/* Mobile header */}
+      <div className="lg:hidden fixed top-0 left-0 right-0 z-40 bg-[#0d0d0d] border-b border-[#2a2a2a]">
+        <div className="flex items-center justify-between p-4">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 bg-white rounded-lg flex items-center justify-center">
+              <Waves className="w-4 h-4 text-black" />
+            </div>
+            <div>
+              <h1 className="text-sm font-semibold text-white">Izwi Audio</h1>
+              <p className="text-xs text-gray-500">Audio Toolkit</p>
+            </div>
+          </div>
+          <button
+            onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+            className="p-2 rounded-lg hover:bg-[#1a1a1a] transition-colors"
+          >
+            <Menu className="w-5 h-5 text-white" />
+          </button>
+        </div>
+      </div>
+
+      {/* Mobile menu overlay */}
+      <AnimatePresence>
+        {mobileMenuOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setMobileMenuOpen(false)}
+            className="lg:hidden fixed inset-0 bg-black/50 z-40"
+          />
+        )}
+      </AnimatePresence>
+
       {/* Sidebar */}
-      <aside className="w-64 border-r border-[#2a2a2a] flex flex-col fixed h-full">
-        {/* Logo */}
-        <div className="p-4 border-b border-[#2a2a2a]">
+      <aside
+        className={clsx(
+          "w-64 border-r border-[#2a2a2a] flex flex-col fixed h-full z-50 bg-[#0d0d0d] transition-transform duration-300",
+          "lg:translate-x-0",
+          mobileMenuOpen ? "translate-x-0" : "-translate-x-full",
+        )}
+      >
+        {/* Logo - hidden on mobile since it's in the header */}
+        <div className="hidden lg:block p-4 border-b border-[#2a2a2a]">
           <div className="flex items-center gap-3">
             <div className="w-9 h-9 bg-white rounded-lg flex items-center justify-center">
               <Waves className="w-5 h-5 text-black" />
@@ -215,7 +259,7 @@ export function Layout({
       </aside>
 
       {/* Main content */}
-      <div className="flex-1 ml-64">
+      <div className="flex-1 lg:ml-64 pt-16 lg:pt-0">
         {/* Error toast */}
         <AnimatePresence>
           {error && (
