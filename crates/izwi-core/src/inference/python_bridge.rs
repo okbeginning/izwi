@@ -54,7 +54,7 @@ impl Default for PythonTTSRequest {
 }
 
 /// Response from Python inference script
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct PythonTTSResponse {
     pub audio_base64: Option<String>,
     pub sample_rate: Option<u32>,

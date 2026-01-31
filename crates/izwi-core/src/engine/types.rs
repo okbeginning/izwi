@@ -297,13 +297,11 @@ impl Default for Priority {
 pub enum ModelType {
     /// Qwen3-TTS models
     Qwen3TTS,
-    /// LFM2-Audio models
-    LFM2Audio,
 }
 
 impl Default for ModelType {
     fn default() -> Self {
-        Self::LFM2Audio
+        Self::Qwen3TTS
     }
 }
 
@@ -314,8 +312,6 @@ pub enum TaskType {
     TTS,
     /// Automatic speech recognition
     ASR,
-    /// Audio-to-audio chat
-    AudioChat,
 }
 
 impl Default for TaskType {

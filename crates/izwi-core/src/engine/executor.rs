@@ -13,7 +13,6 @@ use super::request::EngineCoreRequest;
 use super::scheduler::ScheduledRequest;
 use super::types::{AudioOutput, ModelType, TaskType};
 use crate::error::{Error, Result};
-use crate::inference::lfm2_bridge::{LFM2Bridge, LFM2Response};
 use crate::inference::python_bridge::PythonBridge;
 
 /// Configuration for the model executor.
@@ -34,7 +33,7 @@ pub struct WorkerConfig {
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
-            model_type: ModelType::LFM2Audio,
+            model_type: ModelType::Qwen3TTS,
             models_dir: dirs::data_local_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("izwi")
@@ -121,7 +120,6 @@ pub trait ModelExecutor: Send + Sync {
 /// Python-based model executor using daemon processes.
 pub struct PythonExecutor {
     config: WorkerConfig,
-    lfm2_bridge: LFM2Bridge,
     tts_bridge: PythonBridge,
     initialized: bool,
 }
@@ -131,89 +129,9 @@ impl PythonExecutor {
     pub fn new(config: WorkerConfig) -> Self {
         Self {
             config,
-            lfm2_bridge: LFM2Bridge::new(),
             tts_bridge: PythonBridge::new(),
             initialized: false,
         }
-    }
-
-    /// Execute a single TTS request via LFM2.
-    fn execute_lfm2_tts(&self, request: &EngineCoreRequest) -> Result<ExecutorOutput> {
-        let text = request
-            .text
-            .as_ref()
-            .ok_or_else(|| Error::InvalidInput("TTS requires text".into()))?;
-
-        let voice = request.params.voice.as_deref();
-        let max_tokens = Some(request.params.max_tokens as u32);
-        let audio_temp = request.params.audio_temperature;
-        let audio_top_k = request.params.audio_top_k.map(|k| k as u32);
-
-        let response =
-            self.lfm2_bridge
-                .generate_tts(text, voice, max_tokens, audio_temp, audio_top_k)?;
-
-        self.lfm2_response_to_output(&request.id, response)
-    }
-
-    /// Execute ASR request via LFM2.
-    fn execute_lfm2_asr(&self, request: &EngineCoreRequest) -> Result<ExecutorOutput> {
-        let audio = request
-            .audio_input
-            .as_ref()
-            .ok_or_else(|| Error::InvalidInput("ASR requires audio input".into()))?;
-
-        let max_tokens = Some(request.params.max_tokens as u32);
-
-        let response = self.lfm2_bridge.transcribe(audio, max_tokens)?;
-
-        self.lfm2_response_to_output(&request.id, response)
-    }
-
-    /// Execute audio chat request via LFM2.
-    fn execute_lfm2_chat(&self, request: &EngineCoreRequest) -> Result<ExecutorOutput> {
-        let audio = request.audio_input.as_deref();
-        let text = request.text.as_deref();
-        let max_tokens = Some(request.params.max_tokens as u32);
-        let audio_temp = request.params.audio_temperature;
-        let audio_top_k = request.params.audio_top_k.map(|k| k as u32);
-
-        let response =
-            self.lfm2_bridge
-                .audio_chat(audio, text, max_tokens, audio_temp, audio_top_k)?;
-
-        self.lfm2_response_to_output(&request.id, response)
-    }
-
-    /// Convert LFM2 response to executor output.
-    fn lfm2_response_to_output(
-        &self,
-        request_id: &str,
-        response: LFM2Response,
-    ) -> Result<ExecutorOutput> {
-        if let Some(error) = response.error {
-            return Ok(ExecutorOutput::error(request_id.to_string(), error));
-        }
-
-        let audio = if let Some(audio_b64) = response.audio_base64 {
-            let sample_rate = response.sample_rate.unwrap_or(24000);
-            let samples = decode_audio_base64(&audio_b64, sample_rate)?;
-            Some(AudioOutput::new(samples, sample_rate))
-        } else {
-            None
-        };
-
-        let text = response.text.or(response.transcription);
-
-        Ok(ExecutorOutput {
-            request_id: request_id.to_string(),
-            audio,
-            text,
-            tokens_processed: 0, // Not tracked by daemon
-            tokens_generated: 0, // Not tracked by daemon
-            finished: true,
-            error: None,
-        })
     }
 
     /// Execute a single TTS request via Qwen3-TTS.
@@ -271,9 +189,6 @@ impl ModelExecutor for PythonExecutor {
         // Execute each request (no batching in Python daemon currently)
         for request in requests {
             let result = match (&request.model_type, &request.task_type) {
-                (ModelType::LFM2Audio, TaskType::TTS) => self.execute_lfm2_tts(request),
-                (ModelType::LFM2Audio, TaskType::ASR) => self.execute_lfm2_asr(request),
-                (ModelType::LFM2Audio, TaskType::AudioChat) => self.execute_lfm2_chat(request),
                 (ModelType::Qwen3TTS, TaskType::TTS) => self.execute_qwen_tts(request),
                 _ => Err(Error::InferenceError(format!(
                     "Unsupported model/task combination: {:?}/{:?}",
@@ -300,17 +215,9 @@ impl ModelExecutor for PythonExecutor {
     fn initialize(&mut self) -> Result<()> {
         info!("Initializing Python executor");
 
-        // Start the appropriate daemon based on model type
-        match self.config.model_type {
-            ModelType::LFM2Audio => {
-                self.lfm2_bridge.ensure_daemon_running()?;
-                info!("LFM2 daemon ready");
-            }
-            ModelType::Qwen3TTS => {
-                self.tts_bridge.ensure_daemon_running()?;
-                info!("TTS daemon ready");
-            }
-        }
+        // Start the TTS daemon
+        self.tts_bridge.ensure_daemon_running()?;
+        info!("TTS daemon ready");
 
         self.initialized = true;
         Ok(())
@@ -318,10 +225,6 @@ impl ModelExecutor for PythonExecutor {
 
     fn shutdown(&mut self) -> Result<()> {
         info!("Shutting down Python executor");
-
-        if let Err(e) = self.lfm2_bridge.stop_daemon() {
-            warn!("Error stopping LFM2 daemon: {}", e);
-        }
 
         if let Err(e) = self.tts_bridge.stop_daemon() {
             warn!("Error stopping TTS daemon: {}", e);
@@ -411,6 +314,6 @@ mod tests {
     #[test]
     fn test_worker_config_default() {
         let config = WorkerConfig::default();
-        assert_eq!(config.model_type, ModelType::LFM2Audio);
+        assert_eq!(config.model_type, ModelType::Qwen3TTS);
     }
 }

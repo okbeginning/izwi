@@ -12,7 +12,6 @@ use crate::inference::generation::{
     AudioChunk, GenerationConfig, GenerationRequest, GenerationResult,
 };
 use crate::inference::kv_cache::{KVCache, KVCacheConfig};
-use crate::inference::lfm2_bridge::{LFM2Bridge, LFM2Response};
 use crate::inference::python_bridge::PythonBridge;
 use crate::model::{ModelInfo, ModelManager, ModelVariant};
 use crate::tokenizer::Tokenizer;
@@ -26,7 +25,6 @@ pub struct InferenceEngine {
     _kv_cache: KVCache,
     streaming_config: StreamingConfig,
     python_bridge: PythonBridge,
-    lfm2_bridge: LFM2Bridge,
     asr_bridge: AsrBridge,
     loaded_model_path: Option<std::path::PathBuf>,
 }
@@ -46,7 +44,6 @@ impl InferenceEngine {
             _kv_cache: kv_cache,
             streaming_config: StreamingConfig::default(),
             python_bridge: PythonBridge::new(),
-            lfm2_bridge: LFM2Bridge::new(),
             asr_bridge: AsrBridge::new(),
             loaded_model_path: None,
         })
@@ -341,63 +338,6 @@ impl InferenceEngine {
             .preload_model(std::path::Path::new(model_path))
     }
 
-    // ============ LFM2-Audio Methods ============
-
-    /// Ensure the LFM2 daemon is running
-    pub fn ensure_lfm2_daemon_running(&self) -> Result<()> {
-        self.lfm2_bridge.ensure_daemon_running()
-    }
-
-    /// Stop the LFM2 daemon
-    pub fn stop_lfm2_daemon(&self) -> Result<()> {
-        self.lfm2_bridge.stop_daemon()
-    }
-
-    /// Get LFM2 daemon status
-    pub fn get_lfm2_daemon_status(&self) -> Result<LFM2Response> {
-        self.lfm2_bridge.get_status()
-    }
-
-    /// Generate TTS with LFM2
-    pub fn lfm2_generate_tts(
-        &self,
-        text: &str,
-        voice: Option<&str>,
-        max_new_tokens: Option<u32>,
-        audio_temperature: Option<f32>,
-        audio_top_k: Option<u32>,
-    ) -> Result<LFM2Response> {
-        self.lfm2_bridge
-            .generate_tts(text, voice, max_new_tokens, audio_temperature, audio_top_k)
-    }
-
-    /// Transcribe audio with LFM2 ASR
-    pub fn lfm2_transcribe(
-        &self,
-        audio_base64: &str,
-        max_new_tokens: Option<u32>,
-    ) -> Result<LFM2Response> {
-        self.lfm2_bridge.transcribe(audio_base64, max_new_tokens)
-    }
-
-    /// Audio chat with LFM2
-    pub fn lfm2_audio_chat(
-        &self,
-        audio_base64: Option<&str>,
-        text: Option<&str>,
-        max_new_tokens: Option<u32>,
-        audio_temperature: Option<f32>,
-        audio_top_k: Option<u32>,
-    ) -> Result<LFM2Response> {
-        self.lfm2_bridge.audio_chat(
-            audio_base64,
-            text,
-            max_new_tokens,
-            audio_temperature,
-            audio_top_k,
-        )
-    }
-
     // ============ Qwen3-ASR Methods ============
 
     /// Ensure the ASR daemon is running
@@ -425,10 +365,9 @@ impl InferenceEngine {
         self.asr_bridge.transcribe(audio_base64, model_id, language)
     }
 
-    /// Stop all daemons (TTS, LFM2, ASR)
+    /// Stop all daemons (TTS, ASR)
     pub fn stop_all_daemons(&self) -> Result<()> {
         let _ = self.stop_daemon();
-        let _ = self.stop_lfm2_daemon();
         let _ = self.stop_asr_daemon();
         Ok(())
     }

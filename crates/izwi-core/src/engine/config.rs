@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use super::types::ModelType;
 use super::scheduler::SchedulingPolicy;
+use super::types::ModelType;
 
 /// Configuration for the engine core.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,24 +85,48 @@ fn default_models_dir() -> PathBuf {
         .join("models")
 }
 
-fn default_max_batch_size() -> usize { 8 }
-fn default_max_seq_len() -> usize { 4096 }
-fn default_max_tokens_per_step() -> usize { 512 }
-fn default_block_size() -> usize { 16 }
-fn default_max_blocks() -> usize { 1024 }
-fn default_chunked_prefill() -> bool { true }
-fn default_chunked_prefill_threshold() -> usize { 256 }
-fn default_sample_rate() -> u32 { 24000 }
-fn default_num_codebooks() -> usize { 8 }
-fn default_streaming_chunk_size() -> usize { 4800 } // 200ms at 24kHz
-fn default_use_metal() -> bool { cfg!(target_os = "macos") }
+fn default_max_batch_size() -> usize {
+    8
+}
+fn default_max_seq_len() -> usize {
+    4096
+}
+fn default_max_tokens_per_step() -> usize {
+    512
+}
+fn default_block_size() -> usize {
+    16
+}
+fn default_max_blocks() -> usize {
+    1024
+}
+fn default_chunked_prefill() -> bool {
+    true
+}
+fn default_chunked_prefill_threshold() -> usize {
+    256
+}
+fn default_sample_rate() -> u32 {
+    24000
+}
+fn default_num_codebooks() -> usize {
+    8
+}
+fn default_streaming_chunk_size() -> usize {
+    4800
+} // 200ms at 24kHz
+fn default_use_metal() -> bool {
+    cfg!(target_os = "macos")
+}
 fn default_num_threads() -> usize {
     std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(4)
         .min(8)
 }
-fn default_enable_preemption() -> bool { true }
+fn default_enable_preemption() -> bool {
+    true
+}
 
 impl Default for EngineCoreConfig {
     fn default() -> Self {
@@ -129,16 +153,6 @@ impl Default for EngineCoreConfig {
 }
 
 impl EngineCoreConfig {
-    /// Create config for LFM2-Audio model
-    pub fn for_lfm2() -> Self {
-        Self {
-            model_type: ModelType::LFM2Audio,
-            sample_rate: 24000,
-            num_codebooks: 8,
-            ..Default::default()
-        }
-    }
-
     /// Create config for Qwen3-TTS model
     pub fn for_qwen3_tts() -> Self {
         Self {
@@ -156,7 +170,7 @@ impl EngineCoreConfig {
         let hidden_dim = 1024;
         let num_layers = 24;
         let dtype_bytes = 2; // float16
-        
+
         self.max_blocks * self.block_size * hidden_dim * num_layers * 2 * dtype_bytes
     }
 }
@@ -167,10 +181,6 @@ pub struct DaemonConfig {
     /// Socket path for TTS daemon (Qwen3-TTS)
     #[serde(default = "default_tts_socket")]
     pub tts_socket_path: PathBuf,
-
-    /// Socket path for LFM2 daemon
-    #[serde(default = "default_lfm2_socket")]
-    pub lfm2_socket_path: PathBuf,
 
     /// Timeout for daemon operations (seconds)
     #[serde(default = "default_daemon_timeout")]
@@ -185,16 +195,20 @@ pub struct DaemonConfig {
     pub preload_model: bool,
 }
 
-fn default_tts_socket() -> PathBuf { PathBuf::from("/tmp/izwi_tts_daemon.sock") }
-fn default_lfm2_socket() -> PathBuf { PathBuf::from("/tmp/izwi_lfm2_daemon.sock") }
-fn default_daemon_timeout() -> u64 { 300 } // 5 minutes for slow operations
-fn default_auto_start() -> bool { true }
+fn default_tts_socket() -> PathBuf {
+    PathBuf::from("/tmp/izwi_tts_daemon.sock")
+}
+fn default_daemon_timeout() -> u64 {
+    300
+} // 5 minutes for slow operations
+fn default_auto_start() -> bool {
+    true
+}
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             tts_socket_path: default_tts_socket(),
-            lfm2_socket_path: default_lfm2_socket(),
             timeout_secs: default_daemon_timeout(),
             auto_start: default_auto_start(),
             preload_model: false,

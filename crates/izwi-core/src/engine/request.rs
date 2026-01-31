@@ -65,7 +65,7 @@ impl EngineCoreRequest {
         Self {
             id: Uuid::new_v4().to_string(),
             task_type: TaskType::TTS,
-            model_type: ModelType::LFM2Audio,
+            model_type: ModelType::Qwen3TTS,
             text: Some(text.into()),
             audio_input: None,
             reference_audio: None,
@@ -85,29 +85,9 @@ impl EngineCoreRequest {
         Self {
             id: Uuid::new_v4().to_string(),
             task_type: TaskType::ASR,
-            model_type: ModelType::LFM2Audio,
+            model_type: ModelType::Qwen3TTS,
             text: None,
             audio_input: Some(audio_base64.into()),
-            reference_audio: None,
-            reference_text: None,
-            voice_description: None,
-            params: GenerationParams::default(),
-            priority: Priority::Normal,
-            arrival_time: Instant::now(),
-            prompt_tokens: Vec::new(),
-            streaming: false,
-            streaming_tx: None,
-        }
-    }
-
-    /// Create a new audio chat request.
-    pub fn audio_chat(audio_base64: Option<String>, text: Option<String>) -> Self {
-        Self {
-            id: Uuid::new_v4().to_string(),
-            task_type: TaskType::AudioChat,
-            model_type: ModelType::LFM2Audio,
-            text,
-            audio_input: audio_base64,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -208,13 +188,6 @@ impl RequestProcessor {
                     ));
                 }
             }
-            TaskType::AudioChat => {
-                if request.audio_input.is_none() && request.text.is_none() {
-                    return Err(Error::InvalidInput(
-                        "Audio chat request requires audio or text input".into(),
-                    ));
-                }
-            }
         }
 
         // Validate and clamp parameters
@@ -279,13 +252,6 @@ impl RequestBuilder {
     pub fn asr(audio_base64: impl Into<String>) -> Self {
         Self {
             request: EngineCoreRequest::asr(audio_base64),
-        }
-    }
-
-    /// Create a new audio chat request builder.
-    pub fn audio_chat() -> Self {
-        Self {
-            request: EngineCoreRequest::audio_chat(None, None),
         }
     }
 

@@ -358,7 +358,7 @@ class TTSDaemon:
 
         return None, None
 
-    def handle_request(self, request: dict) -> dict:
+    def handle_request(self, request: dict, conn: socket.socket = None) -> dict:
         """Route request to appropriate handler."""
         command = request.get("command", "generate")
 
@@ -422,7 +422,7 @@ class TTSDaemon:
                     break
 
                 try:
-                    response = self.handle_request(request)
+                    response = self.handle_request(request, conn)
                 except Exception as e:
                     response = {"error": f"Internal error: {str(e)}"}
                     traceback.print_exc(file=sys.stderr)
