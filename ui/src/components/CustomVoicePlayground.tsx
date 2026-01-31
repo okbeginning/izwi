@@ -9,8 +9,9 @@ import {
   Loader2,
   MessageSquare,
 } from "lucide-react";
-import { api } from "../api";
+import { api, TTSGenerationStats } from "../api";
 import { SPEAKERS, SAMPLE_TEXTS } from "../types";
+import { GenerationStats } from "./GenerationStats";
 import clsx from "clsx";
 
 interface CustomVoicePlaygroundProps {
@@ -30,6 +31,8 @@ export function CustomVoicePlayground({
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [generationStats, setGenerationStats] =
+    useState<TTSGenerationStats | null>(null);
 
   const audioRef = useRef<HTMLAudioElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -55,15 +58,17 @@ export function CustomVoicePlayground({
         URL.revokeObjectURL(audioUrl);
         setAudioUrl(null);
       }
+      setGenerationStats(null);
 
-      const blob = await api.generateTTS({
+      const result = await api.generateTTSWithStats({
         text: text.trim(),
         speaker: speaker,
         voice_description: instruct.trim() || undefined,
       });
 
-      const url = URL.createObjectURL(blob);
+      const url = URL.createObjectURL(result.audioBlob);
       setAudioUrl(url);
+      setGenerationStats(result.stats);
 
       setTimeout(() => {
         audioRef.current?.play();
@@ -95,6 +100,7 @@ export function CustomVoicePlayground({
     setText("");
     setInstruct("");
     setError(null);
+    setGenerationStats(null);
     if (audioUrl) {
       URL.revokeObjectURL(audioUrl);
       setAudioUrl(null);
@@ -327,9 +333,19 @@ export function CustomVoicePlayground({
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: 10 }}
-            className="mt-4 p-3 rounded bg-[#1a1a1a] border border-[#2a2a2a]"
+            className="mt-4 space-y-3"
           >
-            <audio ref={audioRef} src={audioUrl} className="w-full" controls />
+            <div className="p-3 rounded bg-[#1a1a1a] border border-[#2a2a2a]">
+              <audio
+                ref={audioRef}
+                src={audioUrl}
+                className="w-full"
+                controls
+              />
+            </div>
+            {generationStats && (
+              <GenerationStats stats={generationStats} type="tts" />
+            )}
           </motion.div>
         )}
       </AnimatePresence>

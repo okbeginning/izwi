@@ -75,6 +75,23 @@ export interface ASRTranscribeRequest {
 export interface ASRTranscribeResponse {
   transcription: string;
   language: string | null;
+  stats?: {
+    processing_time_ms: number;
+    audio_duration_secs: number | null;
+    rtf: number | null;
+  };
+}
+
+export interface TTSGenerationStats {
+  generation_time_ms: number;
+  audio_duration_secs: number;
+  rtf: number;
+  tokens_generated: number;
+}
+
+export interface TTSGenerateResult {
+  audioBlob: Blob;
+  stats: TTSGenerationStats | null;
 }
 
 export interface ASRStatusResponse {
@@ -137,6 +154,11 @@ class ApiClient {
   }
 
   async generateTTS(request: TTSRequest): Promise<Blob> {
+    const result = await this.generateTTSWithStats(request);
+    return result.audioBlob;
+  }
+
+  async generateTTSWithStats(request: TTSRequest): Promise<TTSGenerateResult> {
     const response = await fetch(`${this.baseUrl}/tts/generate`, {
       method: "POST",
       headers: {
@@ -152,7 +174,25 @@ class ApiClient {
       throw new Error(error.error?.message || "TTS generation failed");
     }
 
-    return response.blob();
+    // Extract timing stats from headers
+    const generationTimeMs = response.headers.get("X-Generation-Time-Ms");
+    const audioDurationSecs = response.headers.get("X-Audio-Duration-Secs");
+    const rtf = response.headers.get("X-RTF");
+    const tokensGenerated = response.headers.get("X-Tokens-Generated");
+
+    const stats: TTSGenerationStats | null =
+      generationTimeMs && audioDurationSecs && rtf && tokensGenerated
+        ? {
+            generation_time_ms: parseFloat(generationTimeMs),
+            audio_duration_secs: parseFloat(audioDurationSecs),
+            rtf: parseFloat(rtf),
+            tokens_generated: parseInt(tokensGenerated, 10),
+          }
+        : null;
+
+    const audioBlob = await response.blob();
+
+    return { audioBlob, stats };
   }
 
   async generateTTSStream(request: TTSRequest): Promise<Response> {

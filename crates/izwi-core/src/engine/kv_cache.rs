@@ -318,14 +318,357 @@ pub struct KVCacheStats {
 }
 
 impl KVCacheStats {
-    /// Memory utilization as a percentage.
-    pub fn utilization(&self) -> f32 {
-        if self.memory_capacity_bytes > 0 {
-            self.memory_used_bytes as f32 / self.memory_capacity_bytes as f32
-        } else {
-            0.0
+    /// Get utilization as a percentage (0.0 - 1.0).
+    pub fn utilization(&self) -> f64 {
+        if self.total_blocks == 0 {
+            return 0.0;
+        }
+        self.allocated_blocks as f64 / self.total_blocks as f64
+    }
+}
+
+// ============================================================================
+// Streaming KV Cache for Continuous Audio Prefill
+// ============================================================================
+
+/// Configuration for the streaming KV cache.
+#[derive(Debug, Clone)]
+pub struct StreamingKVCacheConfig {
+    /// Base KV cache configuration
+    pub base_config: KVCacheConfig,
+    /// Maximum context window size (tokens)
+    pub max_context_tokens: usize,
+    /// Sliding window size for context (tokens)
+    pub sliding_window_tokens: usize,
+    /// Enable token eviction when window is full
+    pub enable_eviction: bool,
+    /// Number of tokens to evict at once when needed
+    pub eviction_batch_size: usize,
+}
+
+impl Default for StreamingKVCacheConfig {
+    fn default() -> Self {
+        Self {
+            base_config: KVCacheConfig::default(),
+            max_context_tokens: 4096,
+            sliding_window_tokens: 2048,
+            enable_eviction: true,
+            eviction_batch_size: 256,
         }
     }
+}
+
+/// Token position in the streaming context.
+#[derive(Debug, Clone, Copy)]
+pub struct TokenPosition {
+    /// Absolute position since stream start
+    pub absolute: usize,
+    /// Position within current window
+    pub window: usize,
+    /// Block index containing this token
+    pub block_idx: usize,
+    /// Offset within the block
+    pub block_offset: usize,
+}
+
+/// Streaming sequence state for continuous prefill.
+#[derive(Debug, Clone)]
+pub struct StreamingSequence {
+    /// Request ID
+    pub request_id: String,
+    /// Current token count in the sequence
+    pub token_count: usize,
+    /// Absolute token position (total tokens seen)
+    pub absolute_position: usize,
+    /// Window start position (for sliding window)
+    pub window_start: usize,
+    /// Allocated block IDs
+    pub block_ids: Vec<BlockId>,
+    /// Whether this sequence is in prefill mode
+    pub in_prefill: bool,
+    /// Last update timestamp
+    pub last_update: std::time::Instant,
+}
+
+impl StreamingSequence {
+    /// Create a new streaming sequence.
+    pub fn new(request_id: String) -> Self {
+        Self {
+            request_id,
+            token_count: 0,
+            absolute_position: 0,
+            window_start: 0,
+            block_ids: Vec::new(),
+            in_prefill: true,
+            last_update: std::time::Instant::now(),
+        }
+    }
+
+    /// Get current window size.
+    pub fn window_size(&self) -> usize {
+        self.absolute_position - self.window_start
+    }
+
+    /// Check if window needs to slide.
+    pub fn needs_window_slide(&self, max_window: usize) -> bool {
+        self.window_size() >= max_window
+    }
+}
+
+/// Streaming KV Cache Manager for continuous audio prefill.
+///
+/// Unlike the standard KV cache which grows linearly, this cache
+/// implements a sliding window approach suitable for streaming audio:
+/// - Continuous token ingestion during speech
+/// - Window-based context management
+/// - Automatic eviction of old tokens
+pub struct StreamingKVCacheManager {
+    config: StreamingKVCacheConfig,
+    /// Base allocator
+    allocator: BlockAllocator,
+    /// Active streaming sequences
+    sequences: HashMap<String, StreamingSequence>,
+    /// Block table for each sequence
+    block_table: HashMap<String, Vec<BlockId>>,
+    /// Statistics
+    total_tokens_processed: u64,
+    total_evictions: u64,
+}
+
+impl StreamingKVCacheManager {
+    /// Create a new streaming KV cache manager.
+    pub fn new(config: StreamingKVCacheConfig) -> Self {
+        let allocator = BlockAllocator::new(config.base_config.clone());
+
+        Self {
+            config,
+            allocator,
+            sequences: HashMap::new(),
+            block_table: HashMap::new(),
+            total_tokens_processed: 0,
+            total_evictions: 0,
+        }
+    }
+
+    /// Start a new streaming sequence.
+    pub fn start_sequence(&mut self, request_id: &str) -> bool {
+        if self.sequences.contains_key(request_id) {
+            return false;
+        }
+
+        let sequence = StreamingSequence::new(request_id.to_string());
+        self.sequences.insert(request_id.to_string(), sequence);
+        self.block_table.insert(request_id.to_string(), Vec::new());
+        true
+    }
+
+    /// Append tokens to a streaming sequence.
+    ///
+    /// This is the core method for continuous prefill - it handles:
+    /// - Block allocation for new tokens
+    /// - Window sliding when needed
+    /// - Eviction of old tokens
+    pub fn append_tokens(&mut self, request_id: &str, num_tokens: usize) -> Option<Vec<BlockId>> {
+        let config = self.config.clone();
+
+        // Check if sequence exists and if we need eviction
+        let needs_eviction = {
+            let sequence = self.sequences.get_mut(request_id)?;
+            sequence.last_update = std::time::Instant::now();
+            sequence.needs_window_slide(config.sliding_window_tokens) && config.enable_eviction
+        };
+
+        // Evict if needed (separate borrow scope)
+        if needs_eviction {
+            self.evict_old_tokens(request_id);
+        }
+
+        // Calculate blocks needed
+        let (window_size, current_blocks) = {
+            let sequence = self.sequences.get(request_id)?;
+            let current = self
+                .block_table
+                .get(request_id)
+                .map(|b| b.len())
+                .unwrap_or(0);
+            (sequence.window_size(), current)
+        };
+
+        let total_tokens_after = window_size + num_tokens;
+        let blocks_needed = config.base_config.blocks_for_tokens(total_tokens_after);
+
+        let additional_blocks = if blocks_needed > current_blocks {
+            blocks_needed - current_blocks
+        } else {
+            0
+        };
+
+        // Allocate additional blocks if needed
+        if additional_blocks > 0 {
+            if !self.allocator.can_allocate(additional_blocks) {
+                // Try to evict from other sequences
+                if !self.try_evict_for_space(additional_blocks, request_id) {
+                    return None;
+                }
+            }
+
+            if let Some(blocks) = self.allocator.allocate(additional_blocks) {
+                if let Some(table) = self.block_table.get_mut(request_id) {
+                    table.extend(blocks);
+                }
+            } else {
+                return None;
+            }
+        }
+
+        // Update sequence state
+        if let Some(seq) = self.sequences.get_mut(request_id) {
+            seq.token_count += num_tokens;
+            seq.absolute_position += num_tokens;
+            seq.block_ids = self
+                .block_table
+                .get(request_id)
+                .cloned()
+                .unwrap_or_default();
+        }
+
+        self.total_tokens_processed += num_tokens as u64;
+
+        Some(
+            self.block_table
+                .get(request_id)
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Evict old tokens from a sequence to make room for new ones.
+    fn evict_old_tokens(&mut self, request_id: &str) {
+        let config = self.config.clone();
+
+        let Some(sequence) = self.sequences.get_mut(request_id) else {
+            return;
+        };
+
+        let tokens_to_evict = config.eviction_batch_size;
+        let blocks_to_free = config.base_config.blocks_for_tokens(tokens_to_evict);
+
+        // Free oldest blocks
+        if let Some(table) = self.block_table.get_mut(request_id) {
+            let blocks_freed: Vec<BlockId> =
+                table.drain(..blocks_to_free.min(table.len())).collect();
+            for block_id in blocks_freed {
+                self.allocator.free(block_id);
+            }
+        }
+
+        // Update window start
+        sequence.window_start += tokens_to_evict;
+        sequence.token_count = sequence.token_count.saturating_sub(tokens_to_evict);
+
+        self.total_evictions += 1;
+    }
+
+    /// Try to evict from other sequences to make space.
+    fn try_evict_for_space(&mut self, blocks_needed: usize, exclude_request: &str) -> bool {
+        let mut blocks_freed = 0;
+
+        // Find candidates for eviction (oldest sequences first)
+        let mut candidates: Vec<_> = self
+            .sequences
+            .iter()
+            .filter(|(id, _)| *id != exclude_request)
+            .map(|(id, seq)| (id.clone(), seq.last_update, seq.block_ids.len()))
+            .collect();
+
+        candidates.sort_by_key(|(_, time, _)| *time);
+
+        for (request_id, _, _num_blocks) in candidates {
+            if blocks_freed >= blocks_needed {
+                break;
+            }
+
+            // Evict entire sequence if needed
+            if let Some(table) = self.block_table.get(&request_id) {
+                for &block_id in table {
+                    self.allocator.free(block_id);
+                    blocks_freed += 1;
+                }
+            }
+            self.block_table.remove(&request_id);
+            self.sequences.remove(&request_id);
+        }
+
+        blocks_freed >= blocks_needed
+    }
+
+    /// End a streaming sequence and free all resources.
+    pub fn end_sequence(&mut self, request_id: &str) {
+        if let Some(table) = self.block_table.remove(request_id) {
+            for block_id in table {
+                self.allocator.free(block_id);
+            }
+        }
+        self.sequences.remove(request_id);
+    }
+
+    /// Get sequence info.
+    pub fn get_sequence(&self, request_id: &str) -> Option<&StreamingSequence> {
+        self.sequences.get(request_id)
+    }
+
+    /// Get block table for a sequence.
+    pub fn get_block_table(&self, request_id: &str) -> Option<&[BlockId]> {
+        self.block_table.get(request_id).map(|v| v.as_slice())
+    }
+
+    /// Mark sequence as transitioning from prefill to decode.
+    pub fn end_prefill(&mut self, request_id: &str) {
+        if let Some(seq) = self.sequences.get_mut(request_id) {
+            seq.in_prefill = false;
+        }
+    }
+
+    /// Check if sequence is in prefill mode.
+    pub fn is_in_prefill(&self, request_id: &str) -> bool {
+        self.sequences
+            .get(request_id)
+            .map(|s| s.in_prefill)
+            .unwrap_or(false)
+    }
+
+    /// Get statistics.
+    pub fn stats(&self) -> StreamingKVCacheStats {
+        StreamingKVCacheStats {
+            base_stats: KVCacheStats {
+                total_blocks: self.config.base_config.max_blocks,
+                allocated_blocks: self.allocator.num_allocated(),
+                free_blocks: self.allocator.num_free(),
+                num_sequences: self.sequences.len(),
+                memory_used_bytes: self.allocator.memory_used_bytes(),
+                memory_capacity_bytes: self.allocator.memory_capacity_bytes(),
+            },
+            total_tokens_processed: self.total_tokens_processed,
+            total_evictions: self.total_evictions,
+            active_sequences: self.sequences.len(),
+            sequences_in_prefill: self.sequences.values().filter(|s| s.in_prefill).count(),
+        }
+    }
+}
+
+/// Statistics for the streaming KV cache.
+#[derive(Debug, Clone)]
+pub struct StreamingKVCacheStats {
+    /// Base cache statistics
+    pub base_stats: KVCacheStats,
+    /// Total tokens processed across all sequences
+    pub total_tokens_processed: u64,
+    /// Total number of eviction operations
+    pub total_evictions: u64,
+    /// Number of active streaming sequences
+    pub active_sequences: usize,
+    /// Number of sequences currently in prefill mode
+    pub sequences_in_prefill: usize,
 }
 
 #[cfg(test)]

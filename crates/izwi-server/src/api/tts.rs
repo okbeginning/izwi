@@ -119,13 +119,28 @@ pub async fn generate(
     // Return based on format
     let content_type = izwi_core::audio::AudioEncoder::content_type(format);
 
+    // Calculate stats for headers
+    let duration_secs = result.duration_secs();
+    let generation_time_ms = result.total_time_ms;
+    let rtf = result.rtf();
+    let tokens_generated = result.total_tokens;
+
     if format == AudioFormat::Wav {
-        // Return as binary WAV file
+        // Return as binary WAV file with timing headers
         Ok(Response::builder()
             .header(header::CONTENT_TYPE, content_type)
             .header(
                 header::CONTENT_DISPOSITION,
                 "attachment; filename=\"speech.wav\"",
+            )
+            // Custom headers for timing stats (exposed via Access-Control-Expose-Headers)
+            .header("X-Generation-Time-Ms", format!("{:.1}", generation_time_ms))
+            .header("X-Audio-Duration-Secs", format!("{:.2}", duration_secs))
+            .header("X-RTF", format!("{:.3}", rtf))
+            .header("X-Tokens-Generated", tokens_generated.to_string())
+            .header(
+                "Access-Control-Expose-Headers",
+                "X-Generation-Time-Ms, X-Audio-Duration-Secs, X-RTF, X-Tokens-Generated",
             )
             .body(Body::from(audio_bytes))
             .unwrap())

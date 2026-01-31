@@ -32,6 +32,7 @@ pub mod metrics;
 mod output;
 mod request;
 mod scheduler;
+pub mod signal_frontend;
 mod types;
 
 pub use config::EngineCoreConfig;

@@ -12,6 +12,7 @@ import {
   Check,
 } from "lucide-react";
 import { api } from "../api";
+import { GenerationStats, ASRStats } from "./GenerationStats";
 import clsx from "clsx";
 
 interface TranscriptionPlaygroundProps {
@@ -30,6 +31,7 @@ export function TranscriptionPlayground({
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [processingStats, setProcessingStats] = useState<ASRStats | null>(null);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -78,6 +80,7 @@ export function TranscriptionPlayground({
   const processAudio = async (audioBlob: Blob) => {
     setIsProcessing(true);
     setError(null);
+    setProcessingStats(null);
 
     const url = URL.createObjectURL(audioBlob);
     setAudioUrl(url);
@@ -100,6 +103,15 @@ export function TranscriptionPlayground({
 
       setTranscription(response.transcription);
       setDetectedLanguage(response.language || null);
+
+      // Set processing stats if available
+      if (response.stats) {
+        setProcessingStats({
+          processing_time_ms: response.stats.processing_time_ms,
+          audio_duration_secs: response.stats.audio_duration_secs,
+          rtf: response.stats.rtf,
+        });
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Transcription failed");
     } finally {
@@ -129,6 +141,7 @@ export function TranscriptionPlayground({
     setDetectedLanguage(null);
     setAudioUrl(null);
     setError(null);
+    setProcessingStats(null);
   };
 
   const handleCopy = async () => {
@@ -215,6 +228,13 @@ export function TranscriptionPlayground({
               {transcription}
             </p>
           </div>
+          {processingStats && (
+            <GenerationStats
+              stats={processingStats}
+              type="asr"
+              className="mt-3"
+            />
+          )}
         </div>
       )}
 

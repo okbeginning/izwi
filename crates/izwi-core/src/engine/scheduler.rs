@@ -43,6 +43,32 @@ pub struct SchedulerConfig {
     pub chunked_prefill_threshold: usize,
     /// Enable preemption when KV cache is full
     pub enable_preemption: bool,
+    /// Enable VAD-triggered preemption (for audio interruption handling)
+    pub enable_vad_preemption: bool,
+}
+
+/// Preemption reason - why a request was preempted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreemptionReason {
+    /// Memory pressure - KV cache is full
+    MemoryPressure,
+    /// VAD detected user speech during AI output (interruption)
+    VadInterruption,
+    /// Manual abort by user
+    UserAbort,
+    /// Timeout
+    Timeout,
+}
+
+/// VAD preemption event - signals that user started speaking.
+#[derive(Debug, Clone)]
+pub struct VadPreemptionEvent {
+    /// Timestamp of the VAD detection
+    pub timestamp: Instant,
+    /// Speech probability from VAD
+    pub speech_probability: f32,
+    /// Request IDs that should be preempted (currently generating requests)
+    pub requests_to_preempt: Vec<RequestId>,
 }
 
 impl Default for SchedulerConfig {
@@ -54,6 +80,7 @@ impl Default for SchedulerConfig {
             enable_chunked_prefill: true,
             chunked_prefill_threshold: 256,
             enable_preemption: true,
+            enable_vad_preemption: true,
         }
     }
 }
@@ -67,6 +94,7 @@ impl From<&EngineCoreConfig> for SchedulerConfig {
             enable_chunked_prefill: config.enable_chunked_prefill,
             chunked_prefill_threshold: config.chunked_prefill_threshold,
             enable_preemption: config.enable_preemption,
+            enable_vad_preemption: true, // Default to enabled for audio apps
         }
     }
 }

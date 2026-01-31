@@ -29,6 +29,18 @@ pub struct TranscribeRequest {
 pub struct TranscribeResponse {
     pub transcription: String,
     pub language: Option<String>,
+    pub stats: Option<AsrStats>,
+}
+
+/// ASR processing statistics
+#[derive(Debug, Serialize)]
+pub struct AsrStats {
+    /// Processing time in milliseconds
+    pub processing_time_ms: f64,
+    /// Audio duration in seconds (if available)
+    pub audio_duration_secs: Option<f64>,
+    /// Real-time factor (processing_time / audio_duration)
+    pub rtf: Option<f64>,
 }
 
 /// ASR daemon status response
@@ -207,11 +219,15 @@ pub async fn transcribe(
     State(_state): State<AppState>,
     Json(request): Json<TranscribeRequest>,
 ) -> Result<Json<TranscribeResponse>, ApiError> {
+    use std::time::Instant;
+
     if !is_daemon_running() {
         return Err(ApiError::internal(
             "ASR daemon not running. Please start it first.",
         ));
     }
+
+    let start_time = Instant::now();
 
     let message = serde_json::json!({
         "command": "transcribe",
@@ -221,6 +237,8 @@ pub async fn transcribe(
     });
 
     let response = send_daemon_message(&message)?;
+
+    let processing_time_ms = start_time.elapsed().as_secs_f64() * 1000.0;
 
     if let Some(error) = response.get("error").and_then(|v| v.as_str()) {
         return Err(ApiError::internal(error.to_string()));
@@ -237,8 +255,25 @@ pub async fn transcribe(
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    // Extract audio duration from daemon response if available
+    let audio_duration_secs = response.get("audio_duration_secs").and_then(|v| v.as_f64());
+
+    // Calculate RTF if we have audio duration
+    let rtf = audio_duration_secs.map(|dur| {
+        if dur > 0.0 {
+            (processing_time_ms / 1000.0) / dur
+        } else {
+            0.0
+        }
+    });
+
     Ok(Json(TranscribeResponse {
         transcription,
         language,
+        stats: Some(AsrStats {
+            processing_time_ms,
+            audio_duration_secs,
+            rtf,
+        }),
     }))
 }
