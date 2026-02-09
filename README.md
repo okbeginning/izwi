@@ -1,211 +1,139 @@
-# Izwi - Qwen3-TTS Inference Engine for Apple Silicon
+# Izwi - A local audio inference engine
 
-A high-performance, Rust-based text-to-speech inference engine optimized for Qwen3-TTS models on Apple Silicon (M1+) using MLX.
+Izwi is a Rust-based local inference stack for speech and audio workflows, with:
+- text-to-speech (TTS),
+- automatic speech recognition (ASR),
+- chat/audio-chat model support,
+- a CLI-first workflow (`izwi`) and a web UI.
+
+The server exposes OpenAI-style routes under `/v1` and is easiest to run through the CLI.
 
 ![Izwi Screenshot](images/screenshot.png)
 
 ## Features
 
-- **Apple Silicon Optimized**: Built on MLX for unified memory and Metal GPU acceleration
-- **Streaming Audio**: Ultra-low-latency streaming with ~97ms first-packet emission
-- **Model Management**: Download and manage Qwen3-TTS models directly from the UI
-- **Modern Web UI**: Beautiful React-based interface for testing TTS
-- **REST API**: OpenAI-compatible endpoints for easy integration
-- **Voice Cloning**: Support for reference audio-based voice cloning (CustomVoice models)
-
-## Quick Start (Recommended: CLI)
-
-The `izwi` CLI is the easiest way to start testing and using this repository.
-
-```bash
-# Build CLI
-cargo build -p izwi-cli
-
-# Start server
-./target/debug/izwi serve
-```
-
-In a second terminal:
-
-```bash
-# Check status and local models
-./target/debug/izwi status
-./target/debug/izwi list --local
-
-# ASR smoke test
-./target/debug/izwi transcribe data/test.wav --model qwen3-asr-0.6b --format text
-
-# TTS smoke test
-./target/debug/izwi tts "hello from izwi cli" --model qwen3-tts-0.6b-base --output /tmp/hello.wav
-```
-
-CLI documentation: `crates/izwi-cli/README.md`
-
-## Supported Models
-
-### Text-to-Speech (TTS)
-
-| Model | Size | What You Can Do |
-|-------|------|----------------|
-| **Qwen3-TTS-12Hz-0.6B-Base** | ~1.2GB | Generate speech with 9 built-in voices (fast, lightweight) |
-| **Qwen3-TTS-12Hz-0.6B-CustomVoice** | ~1.2GB | Clone any voice using a reference audio sample |
-| **Qwen3-TTS-12Hz-1.7B-Base** | ~3.4GB | Generate higher quality speech with 9 built-in voices |
-| **Qwen3-TTS-12Hz-1.7B-CustomVoice** | ~3.4GB | Clone any voice with better quality (requires reference audio) |
-| **Qwen3-TTS-12Hz-1.7B-VoiceDesign** | ~3.4GB | Design custom voices using text descriptions (e.g., "deep male voice with British accent") |
-
-### Speech-to-Text (ASR)
-
-| Model | Size | What You Can Do |
-|-------|------|----------------|
-| **Qwen3-ASR-0.6B** | ~1.2GB | Transcribe audio to text (fast, lightweight) |
-| **Qwen3-ASR-1.7B** | ~3.4GB | Transcribe audio to text with higher accuracy |
+- Local-first audio inference with Rust backend
+- CLI for serving, model lifecycle management, TTS, ASR, chat, and benchmarking
+- Model download/load/unload flows from Hugging Face
+- Web UI (React + Vite) for interactive testing
+- Apple Silicon acceleration support (Metal), with cross-platform native builds
 
 ## Requirements
 
-### Native Development
-- macOS 12+ with Apple Silicon (M1/M2/M3) or Linux with CUDA
-- **Rust 1.83+** (required for tokenizers dependency)
-- Node.js 18+ (for UI development)
+- Rust toolchain (stable; Rust 1.83+ recommended)
+- Node.js 18+ and npm (for UI dependencies and local UI dev/build)
+- macOS or Linux
 
-### Docker (Recommended)
-- Docker 24+ with Compose V2
-- NVIDIA Container Toolkit (for GPU support on Linux)
-
-### Upgrading Rust
+Install Rust if needed:
 
 ```bash
-rustup update stable
-# Or install if not present:
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-## Quick Start (Docker)
-
-### Production Deployment
-
-```bash
-# CPU version
-docker compose up -d
-
-# CUDA/GPU version (Linux only)
-docker compose --profile cuda up -d
-
-# View logs
-docker compose logs -f
-```
-
-The server will be available at `http://localhost:8080`
-
-### Development with Docker
-
-```bash
-# Start development environment
-./scripts/dev.sh up
-
-# Open shell in container
-./scripts/dev.sh shell
-
-# Inside the container, run:
-cargo watch -x run          # Backend with hot reload
-cd ui && npm run dev --host # Frontend dev server
+source "$HOME/.cargo/env"
+rustup update stable
 ```
 
 ## Quick Start (Native)
 
-### 1. Build the Rust Server
-
-```bash
-# Build in release mode
-cargo build --release
-```
-
-### 2. Build the Web UI
+### 1. Install UI dependencies
 
 ```bash
 cd ui
 npm install
+cd ..
+```
+
+### 2. Build release binaries
+
+On macOS:
+
+```bash
+cargo build --release --features metal
+```
+
+On Linux/other platforms:
+
+```bash
+cargo build --release
+```
+
+### 3. Install CLI + server binaries
+
+```bash
+./scripts/install-cli.sh
+```
+
+The install script places `izwi` and `izwi-server` in `~/.local/bin` by default and updates shell setup.
+
+### 4. Start Izwi
+
+```bash
+izwi serve
+```
+
+Server URL: `http://localhost:8080`
+
+To serve the bundled UI from the same server endpoint, build it once:
+
+```bash
+cd ui
 npm run build
 cd ..
 ```
 
-### 3. Run the Server
+### 5. (Optional) Start the UI in dev mode
 
-```bash
-# Run the server
-./target/release/izwi-server
-```
-
-The server will start at `http://localhost:8080`
-
-### 4. Open the UI
-
-Navigate to `http://localhost:8080` in your browser.
-
-## Development (Native)
-
-### Run in Development Mode
-
-**Terminal 1 - Rust Server:**
-```bash
-cargo run -p izwi-server
-```
-
-**Terminal 2 - UI Dev Server:**
 ```bash
 cd ui
 npm run dev
 ```
 
-The UI will be available at `http://localhost:5173` with hot reload.
+Dev UI URL: `http://localhost:5173`
 
-## API Reference
+## First Commands to Run
 
-### List Models
-
-```bash
-GET /v1/models
-```
-
-### Download Model
+Use these to verify end-to-end setup:
 
 ```bash
-POST /v1/admin/models/{variant}/download
+izwi status
+izwi list --local
+izwi pull qwen3-tts-0.6b-base
+izwi tts "Hello from Izwi" --model qwen3-tts-0.6b-base --output /tmp/hello.wav
+izwi transcribe data/test.wav --model qwen3-asr-0.6b --format text
 ```
 
-### Load Model
+## CLI Commands (Brief Overview)
+
+`izwi` is the primary interface. Core command groups:
+
+- `serve`: start the local API server
+- `list`, `pull`, `rm`, `models ...`: inspect/download/load/unload models
+- `tts`: generate speech from text
+- `transcribe`: convert audio to text
+- `chat`: chat with supported chat/audio-chat models
+- `bench`: run throughput and task-specific benchmarks
+- `status`: inspect health and runtime state
+- `config`: inspect or change CLI configuration
+
+Get full command help:
 
 ```bash
-POST /v1/admin/models/{variant}/load
+izwi --help
+izwi models --help
+izwi tts --help
+izwi transcribe --help
 ```
 
-### Generate Speech
+## Supported Model Families
 
-```bash
-POST /v1/audio/speech
-Content-Type: application/json
+The codebase currently includes model variants for:
+- Qwen3 TTS (base/custom voice/voice design, including quantized variants),
+- Qwen3 ASR (0.6B/1.7B + quantized variants),
+- Qwen3 chat (0.6B 4-bit),
+- Qwen3 forced aligner,
+- Voxtral realtime (coming soon),
+- LFM2-Audio (coming soon).
 
-{
-  "model": "qwen3-tts-0.6b-base",
-  "input": "Hello, world!",
-  "voice": "default",
-  "temperature": 0.7,
-  "speed": 1.0,
-  "response_format": "wav"
-}
-```
-
-### Transcribe Audio
-
-```bash
-POST /v1/audio/transcriptions
-Content-Type: application/json
-
-{
-  "audio_base64": "<base64-encoded-audio>",
-  "model": "qwen3-asr-0.6b",
-  "language": "auto"
-}
-```
+Run `izwi list` to view exact variants and local availability on your machine.
 
 ## License
 
