@@ -84,7 +84,7 @@ export interface TTSRequest {
   reference_audio?: string;
   reference_text?: string;
   max_tokens?: number;
-  format?: "wav" | "raw_f32" | "raw_i16";
+  format?: "wav" | "pcm" | "raw_f32" | "raw_i16";
   temperature?: number;
   speed?: number;
 }
@@ -99,6 +99,50 @@ export interface TTSGenerationStats {
 export interface TTSGenerateResult {
   audioBlob: Blob;
   stats: TTSGenerationStats | null;
+}
+
+export type TTSStreamEvent =
+  | {
+      event: "start";
+      request_id: string;
+      sample_rate: number;
+      audio_format: "wav" | "pcm_i16" | "pcm_f32";
+    }
+  | {
+      event: "chunk";
+      request_id: string;
+      sequence: number;
+      audio_base64: string;
+      sample_count: number;
+      is_final: boolean;
+    }
+  | {
+      event: "final";
+      request_id: string;
+      tokens_generated: number;
+      generation_time_ms: number;
+      audio_duration_secs: number;
+      rtf: number;
+    }
+  | { event: "error"; request_id?: string; error: string }
+  | { event: "done"; request_id?: string };
+
+export interface TTSStreamCallbacks {
+  onStart?: (event: {
+    requestId: string;
+    sampleRate: number;
+    audioFormat: "wav" | "pcm_i16" | "pcm_f32";
+  }) => void;
+  onChunk?: (event: {
+    requestId: string;
+    sequence: number;
+    audioBase64: string;
+    sampleCount: number;
+    isFinal: boolean;
+  }) => void;
+  onFinal?: (stats: TTSGenerationStats) => void;
+  onError?: (error: string) => void;
+  onDone?: () => void;
 }
 
 // ============================================================================
@@ -291,7 +335,7 @@ class ApiClient {
         max_tokens: request.max_tokens,
         temperature: request.temperature,
         speed: request.speed,
-        response_format: "wav",
+        response_format: request.format ?? "wav",
       }),
     });
 
@@ -321,36 +365,121 @@ class ApiClient {
     return { audioBlob, stats };
   }
 
-  async generateTTSStream(request: TTSRequest): Promise<Response> {
-    const response = await fetch(`${this.baseUrl}/audio/speech`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: request.model_id,
-        input: request.text,
-        language: request.language,
-        voice: request.speaker,
-        instructions: request.voice_description,
-        reference_audio: request.reference_audio,
-        reference_text: request.reference_text,
-        max_tokens: request.max_tokens,
-        temperature: request.temperature,
-        speed: request.speed,
-        response_format: "wav",
-        stream: true,
-      }),
-    });
+  generateTTSStream(
+    request: TTSRequest,
+    callbacks: TTSStreamCallbacks,
+  ): AbortController {
+    const abortController = new AbortController();
 
-    if (!response.ok) {
-      const error = await response
-        .json()
-        .catch(() => ({ error: { message: "TTS streaming failed" } }));
-      throw new Error(error.error?.message || "TTS streaming failed");
-    }
+    const startStream = async () => {
+      try {
+        const response = await fetch(`${this.baseUrl}/audio/speech`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: request.model_id,
+            input: request.text,
+            language: request.language,
+            voice: request.speaker,
+            instructions: request.voice_description,
+            reference_audio: request.reference_audio,
+            reference_text: request.reference_text,
+            max_tokens: request.max_tokens,
+            temperature: request.temperature,
+            speed: request.speed,
+            response_format: request.format ?? "pcm",
+            stream: true,
+          }),
+          signal: abortController.signal,
+        });
 
-    return response;
+        if (!response.ok) {
+          const error = await response
+            .json()
+            .catch(() => ({ error: { message: "TTS streaming failed" } }));
+          callbacks.onError?.(error.error?.message || "TTS streaming failed");
+          callbacks.onDone?.();
+          return;
+        }
+
+        const reader = response.body?.getReader();
+        if (!reader) {
+          callbacks.onError?.("No response body");
+          callbacks.onDone?.();
+          return;
+        }
+
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            if (!line.startsWith("data:")) continue;
+            const data = line.slice(5).trim();
+            if (!data) continue;
+
+            try {
+              const event = JSON.parse(data) as TTSStreamEvent;
+              switch (event.event) {
+                case "start":
+                  callbacks.onStart?.({
+                    requestId: event.request_id,
+                    sampleRate: event.sample_rate,
+                    audioFormat: event.audio_format,
+                  });
+                  break;
+                case "chunk":
+                  callbacks.onChunk?.({
+                    requestId: event.request_id,
+                    sequence: event.sequence,
+                    audioBase64: event.audio_base64,
+                    sampleCount: event.sample_count,
+                    isFinal: event.is_final,
+                  });
+                  break;
+                case "final":
+                  callbacks.onFinal?.({
+                    generation_time_ms: event.generation_time_ms,
+                    audio_duration_secs: event.audio_duration_secs,
+                    rtf: event.rtf,
+                    tokens_generated: event.tokens_generated,
+                  });
+                  break;
+                case "error":
+                  callbacks.onError?.(event.error);
+                  break;
+                case "done":
+                  callbacks.onDone?.();
+                  return;
+              }
+            } catch {
+              // Skip malformed payloads.
+            }
+          }
+        }
+
+        callbacks.onDone?.();
+      } catch (error) {
+        if ((error as Error).name !== "AbortError") {
+          callbacks.onError?.(
+            error instanceof Error ? error.message : "TTS stream error",
+          );
+        }
+        callbacks.onDone?.();
+      }
+    };
+
+    startStream();
+    return abortController;
   }
 
   // ========================================================================

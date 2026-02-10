@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Volume2,
@@ -8,6 +8,7 @@ import {
   ChevronDown,
   Loader2,
   MessageSquare,
+  Radio,
 } from "lucide-react";
 import { api, TTSGenerationStats } from "../api";
 import { SPEAKERS } from "../types";
@@ -19,6 +20,72 @@ interface CustomVoicePlaygroundProps {
   onModelRequired: () => void;
 }
 
+function decodePcmI16Base64(base64Data: string): Float32Array {
+  const binary = atob(base64Data);
+  const sampleCount = Math.floor(binary.length / 2);
+  const out = new Float32Array(sampleCount);
+
+  for (let i = 0; i < sampleCount; i += 1) {
+    const lo = binary.charCodeAt(i * 2);
+    const hi = binary.charCodeAt(i * 2 + 1);
+    let value = (hi << 8) | lo;
+    if (value & 0x8000) {
+      value -= 0x10000;
+    }
+    out[i] = value / 0x8000;
+  }
+
+  return out;
+}
+
+function mergeSampleChunks(chunks: Float32Array[]): Float32Array {
+  const totalSamples = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const merged = new Float32Array(totalSamples);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return merged;
+}
+
+function encodeWavPcm16(samples: Float32Array, sampleRate: number): Blob {
+  const bytesPerSample = 2;
+  const dataSize = samples.length * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  const writeString = (offset: number, value: string) => {
+    for (let i = 0; i < value.length; i += 1) {
+      view.setUint8(offset + i, value.charCodeAt(i));
+    }
+  };
+
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * bytesPerSample, true);
+  view.setUint16(32, bytesPerSample, true);
+  view.setUint16(34, 16, true);
+  writeString(36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i += 1) {
+    const clamped = Math.max(-1, Math.min(1, samples[i]));
+    const int16 = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+    view.setInt16(offset, int16, true);
+    offset += 2;
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
 export function CustomVoicePlayground({
   selectedModel,
   onModelRequired,
@@ -28,7 +95,9 @@ export function CustomVoicePlayground({
   const [instruct, setInstruct] = useState("");
   const [showSpeakerSelect, setShowSpeakerSelect] = useState(false);
   const [showInstruct, setShowInstruct] = useState(false);
+  const [streamingEnabled, setStreamingEnabled] = useState(true);
   const [generating, setGenerating] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [generationStats, setGenerationStats] =
@@ -36,8 +105,57 @@ export function CustomVoicePlayground({
 
   const audioRef = useRef<HTMLAudioElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const audioUrlRef = useRef<string | null>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const playbackContextRef = useRef<AudioContext | null>(null);
+  const playbackSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const nextPlaybackTimeRef = useRef(0);
+  const streamSampleRateRef = useRef(24000);
+  const streamSamplesRef = useRef<Float32Array[]>([]);
 
   const selectedSpeaker = SPEAKERS.find((s) => s.id === speaker);
+
+  const replaceAudioUrl = useCallback((nextUrl: string | null) => {
+    if (audioUrlRef.current) {
+      URL.revokeObjectURL(audioUrlRef.current);
+    }
+    audioUrlRef.current = nextUrl;
+    setAudioUrl(nextUrl);
+  }, []);
+
+  const stopStreamingSession = useCallback(() => {
+    if (streamAbortRef.current) {
+      streamAbortRef.current.abort();
+      streamAbortRef.current = null;
+    }
+
+    for (const source of playbackSourcesRef.current) {
+      try {
+        source.stop();
+      } catch {
+        // Ignore already-stopped sources.
+      }
+    }
+    playbackSourcesRef.current.clear();
+
+    if (playbackContextRef.current) {
+      playbackContextRef.current.close().catch(() => {});
+      playbackContextRef.current = null;
+    }
+
+    nextPlaybackTimeRef.current = 0;
+    streamSamplesRef.current = [];
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      stopStreamingSession();
+      if (audioUrlRef.current) {
+        URL.revokeObjectURL(audioUrlRef.current);
+        audioUrlRef.current = null;
+      }
+    };
+  }, [stopStreamingSession]);
 
   const handleGenerate = async () => {
     if (!selectedModel) {
@@ -52,37 +170,124 @@ export function CustomVoicePlayground({
 
     try {
       setGenerating(true);
+      setIsStreaming(false);
       setError(null);
-
-      if (audioUrl) {
-        URL.revokeObjectURL(audioUrl);
-        setAudioUrl(null);
-      }
       setGenerationStats(null);
+      stopStreamingSession();
+      replaceAudioUrl(null);
 
-      const result = await api.generateTTSWithStats({
+      const request = {
         text: text.trim(),
         model_id: selectedModel,
         max_tokens: 0,
-        speaker: speaker,
+        speaker,
         voice_description: instruct.trim() || undefined,
-      });
+      };
 
-      const url = URL.createObjectURL(result.audioBlob);
-      setAudioUrl(url);
-      setGenerationStats(result.stats);
+      if (!streamingEnabled) {
+        const result = await api.generateTTSWithStats(request);
+        const url = URL.createObjectURL(result.audioBlob);
+        replaceAudioUrl(url);
+        setGenerationStats(result.stats);
 
-      setTimeout(() => {
-        audioRef.current?.play();
-      }, 100);
+        setTimeout(() => {
+          audioRef.current?.play().catch(() => {});
+        }, 100);
+
+        setGenerating(false);
+        return;
+      }
+
+      const audioContext = new AudioContext();
+      playbackContextRef.current = audioContext;
+      nextPlaybackTimeRef.current = audioContext.currentTime + 0.05;
+      streamSampleRateRef.current = 24000;
+      streamSamplesRef.current = [];
+      setIsStreaming(true);
+
+      streamAbortRef.current = api.generateTTSStream(
+        {
+          ...request,
+          format: "pcm",
+        },
+        {
+          onStart: ({ sampleRate, audioFormat }) => {
+            streamSampleRateRef.current = sampleRate;
+            if (audioFormat !== "pcm_i16") {
+              setError(
+                `Unsupported streamed audio format '${audioFormat}'. Expected pcm_i16.`,
+              );
+            }
+          },
+          onChunk: ({ audioBase64 }) => {
+            const context = playbackContextRef.current;
+            if (!context) return;
+
+            const samples = decodePcmI16Base64(audioBase64);
+            if (samples.length === 0) return;
+            streamSamplesRef.current.push(samples);
+
+            const buffer = context.createBuffer(
+              1,
+              samples.length,
+              streamSampleRateRef.current,
+            );
+            const chunkForPlayback = new Float32Array(samples.length);
+            chunkForPlayback.set(samples);
+            buffer.copyToChannel(chunkForPlayback, 0);
+
+            const source = context.createBufferSource();
+            source.buffer = buffer;
+            source.connect(context.destination);
+
+            const scheduledAt = Math.max(
+              context.currentTime + 0.02,
+              nextPlaybackTimeRef.current,
+            );
+            source.start(scheduledAt);
+            nextPlaybackTimeRef.current = scheduledAt + buffer.duration;
+
+            playbackSourcesRef.current.add(source);
+            source.onended = () => {
+              playbackSourcesRef.current.delete(source);
+            };
+
+            if (context.state === "suspended") {
+              context.resume().catch(() => {});
+            }
+          },
+          onFinal: (stats) => {
+            setGenerationStats(stats);
+          },
+          onError: (errorMessage) => {
+            setError(errorMessage);
+          },
+          onDone: () => {
+            streamAbortRef.current = null;
+            setIsStreaming(false);
+            setGenerating(false);
+
+            const merged = mergeSampleChunks(streamSamplesRef.current);
+            if (merged.length > 0) {
+              const wavBlob = encodeWavPcm16(merged, streamSampleRateRef.current);
+              const url = URL.createObjectURL(wavBlob);
+              replaceAudioUrl(url);
+            }
+          },
+        },
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Generation failed");
-    } finally {
       setGenerating(false);
+      setIsStreaming(false);
     }
   };
 
   const handleStop = () => {
+    stopStreamingSession();
+    setGenerating(false);
+    setIsStreaming(false);
+
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current.currentTime = 0;
@@ -99,14 +304,14 @@ export function CustomVoicePlayground({
   };
 
   const handleReset = () => {
+    stopStreamingSession();
     setText("");
     setInstruct("");
     setError(null);
     setGenerationStats(null);
-    if (audioUrl) {
-      URL.revokeObjectURL(audioUrl);
-      setAudioUrl(null);
-    }
+    setGenerating(false);
+    setIsStreaming(false);
+    replaceAudioUrl(null);
     textareaRef.current?.focus();
   };
 
@@ -207,20 +412,36 @@ export function CustomVoicePlayground({
           </div>
         </div>
 
-        {/* Instruct toggle */}
-        <button
-          onClick={() => setShowInstruct(!showInstruct)}
-          className="flex items-center gap-2 text-xs text-gray-500 hover:text-gray-300 transition-colors"
-        >
-          <MessageSquare className="w-3.5 h-3.5" />
-          {showInstruct ? "Hide" : "Add"} speaking instructions
-          <ChevronDown
-            className={clsx(
-              "w-3 h-3 transition-transform",
-              showInstruct && "rotate-180",
-            )}
-          />
-        </button>
+        <div className="flex items-center justify-between">
+          {/* Instruct toggle */}
+          <button
+            onClick={() => setShowInstruct(!showInstruct)}
+            className="flex items-center gap-2 text-xs text-gray-500 hover:text-gray-300 transition-colors"
+          >
+            <MessageSquare className="w-3.5 h-3.5" />
+            {showInstruct ? "Hide" : "Add"} speaking instructions
+            <ChevronDown
+              className={clsx(
+                "w-3 h-3 transition-transform",
+                showInstruct && "rotate-180",
+              )}
+            />
+          </button>
+
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={streamingEnabled}
+              onChange={(e) => setStreamingEnabled(e.target.checked)}
+              className="w-4 h-4 rounded border-gray-600 bg-[#1a1a1a] text-emerald-500 focus:ring-emerald-500 focus:ring-offset-0"
+              disabled={generating}
+            />
+            <span className="text-xs text-gray-400 flex items-center gap-1">
+              <Radio className="w-3 h-3" />
+              Stream
+            </span>
+          </label>
+        </div>
 
         <AnimatePresence>
           {showInstruct && (
@@ -263,6 +484,13 @@ export function CustomVoicePlayground({
           )}
         </AnimatePresence>
 
+        {isStreaming && (
+          <div className="p-2 rounded bg-emerald-950/30 border border-emerald-900/40 text-emerald-400 text-xs flex items-center gap-2">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+            Streaming audio chunks...
+          </div>
+        )}
+
         {/* Actions */}
         <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
           <button
@@ -276,14 +504,14 @@ export function CustomVoicePlayground({
             {generating ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />
-                Generating...
+                {isStreaming ? "Streaming..." : "Generating..."}
               </>
             ) : (
               "Generate"
             )}
           </button>
 
-          {audioUrl && (
+          {(audioUrl || isStreaming) && (
             <>
               <button
                 onClick={handleStop}
@@ -291,12 +519,14 @@ export function CustomVoicePlayground({
               >
                 <Square className="w-4 h-4" />
               </button>
-              <button
-                onClick={handleDownload}
-                className="btn btn-secondary min-h-[44px] min-w-[44px]"
-              >
-                <Download className="w-4 h-4" />
-              </button>
+              {audioUrl && (
+                <button
+                  onClick={handleDownload}
+                  className="btn btn-secondary min-h-[44px] min-w-[44px]"
+                >
+                  <Download className="w-4 h-4" />
+                </button>
+              )}
               <button
                 onClick={handleReset}
                 className="btn btn-ghost min-h-[44px] min-w-[44px]"

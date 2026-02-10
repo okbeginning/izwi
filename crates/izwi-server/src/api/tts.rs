@@ -3,14 +3,15 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{header, Response},
+    http::{header, StatusCode},
+    response::Response,
     Json,
 };
-use futures::StreamExt;
-use serde::Deserialize;
-use std::time::Duration;
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
 
 use crate::error::ApiError;
@@ -55,6 +56,35 @@ pub struct SpeechRequest {
     /// Optional reference transcript for cloning.
     #[serde(default)]
     pub reference_text: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SpeechStreamEvent {
+    event: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sequence: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sample_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_final: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sample_rate: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_format: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens_generated: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation_time_ms: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_duration_secs: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rtf: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 pub async fn speech(
@@ -134,7 +164,7 @@ pub async fn speech(
 }
 
 async fn stream_speech(state: AppState, req: SpeechRequest) -> Result<Response<Body>, ApiError> {
-    let format = parse_response_format(req.response_format.as_deref().unwrap_or("wav"))?;
+    let format = parse_response_format(req.response_format.as_deref().unwrap_or("pcm"))?;
 
     let mut gen_config = GenerationConfig {
         streaming: true,
@@ -161,35 +191,246 @@ async fn stream_speech(state: AppState, req: SpeechRequest) -> Result<Response<B
         voice_description: req.instructions.clone(),
     };
 
-    let sample_rate = state.engine.sample_rate().await;
-    let (tx, rx) = mpsc::channel::<AudioChunk>(32);
+    let stream_request_id = gen_request.id.clone();
+    let stream_audio_format = stream_audio_format_label(format);
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<String>();
 
     let engine = state.engine.clone();
+    let semaphore = state.request_semaphore.clone();
     let timeout = Duration::from_secs(state.request_timeout_secs);
     tokio::spawn(async move {
-        let result = tokio::time::timeout(timeout, async {
-            engine.generate_streaming(gen_request, tx).await
-        })
-        .await;
+        let _permit = match semaphore.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                let error_event = SpeechStreamEvent {
+                    event: "error",
+                    request_id: Some(stream_request_id.clone()),
+                    sequence: None,
+                    audio_base64: None,
+                    sample_count: None,
+                    is_final: None,
+                    sample_rate: None,
+                    audio_format: None,
+                    tokens_generated: None,
+                    generation_time_ms: None,
+                    audio_duration_secs: None,
+                    rtf: None,
+                    error: Some("Server is shutting down".to_string()),
+                };
+                let _ = event_tx.send(serde_json::to_string(&error_event).unwrap_or_default());
 
-        if result.is_err() {
-            tracing::error!("Streaming generation timeout");
-        } else if let Err(err) = result.unwrap_or_else(|_| Ok(())) {
-            tracing::error!("Streaming generation error: {}", err);
+                let done_event = SpeechStreamEvent {
+                    event: "done",
+                    request_id: Some(stream_request_id),
+                    sequence: None,
+                    audio_base64: None,
+                    sample_count: None,
+                    is_final: None,
+                    sample_rate: None,
+                    audio_format: None,
+                    tokens_generated: None,
+                    generation_time_ms: None,
+                    audio_duration_secs: None,
+                    rtf: None,
+                    error: None,
+                };
+                let _ = event_tx.send(serde_json::to_string(&done_event).unwrap_or_default());
+                return;
+            }
+        };
+
+        let sample_rate = engine.sample_rate().await;
+        let start_event = SpeechStreamEvent {
+            event: "start",
+            request_id: Some(stream_request_id.clone()),
+            sequence: None,
+            audio_base64: None,
+            sample_count: None,
+            is_final: None,
+            sample_rate: Some(sample_rate),
+            audio_format: Some(stream_audio_format),
+            tokens_generated: None,
+            generation_time_ms: None,
+            audio_duration_secs: None,
+            rtf: None,
+            error: None,
+        };
+        let _ = event_tx.send(serde_json::to_string(&start_event).unwrap_or_default());
+
+        let (chunk_tx, mut chunk_rx) = mpsc::channel::<AudioChunk>(32);
+        let generation_engine = engine.clone();
+        let generation_task = tokio::spawn(async move {
+            tokio::time::timeout(
+                timeout,
+                generation_engine.generate_streaming(gen_request, chunk_tx),
+            )
+            .await
+        });
+
+        let mut total_samples = 0usize;
+        let stream_started = Instant::now();
+        let encoder = izwi_core::audio::AudioEncoder::new(sample_rate, 1);
+
+        while let Some(chunk) = chunk_rx.recv().await {
+            if chunk.samples.is_empty() {
+                continue;
+            }
+
+            total_samples += chunk.samples.len();
+            let bytes = match encoder.encode(&chunk.samples, format) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    let error_event = SpeechStreamEvent {
+                        event: "error",
+                        request_id: Some(stream_request_id.clone()),
+                        sequence: None,
+                        audio_base64: None,
+                        sample_count: None,
+                        is_final: None,
+                        sample_rate: None,
+                        audio_format: None,
+                        tokens_generated: None,
+                        generation_time_ms: None,
+                        audio_duration_secs: None,
+                        rtf: None,
+                        error: Some(format!("Failed to encode audio chunk: {}", err)),
+                    };
+                    let _ = event_tx.send(serde_json::to_string(&error_event).unwrap_or_default());
+                    break;
+                }
+            };
+
+            let chunk_event = SpeechStreamEvent {
+                event: "chunk",
+                request_id: Some(chunk.request_id.clone()),
+                sequence: Some(chunk.sequence),
+                audio_base64: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+                sample_count: Some(chunk.samples.len()),
+                is_final: Some(chunk.is_final),
+                sample_rate: None,
+                audio_format: None,
+                tokens_generated: None,
+                generation_time_ms: None,
+                audio_duration_secs: None,
+                rtf: None,
+                error: None,
+            };
+            let _ = event_tx.send(serde_json::to_string(&chunk_event).unwrap_or_default());
         }
+
+        let generation_outcome = generation_task.await;
+        match generation_outcome {
+            Ok(Ok(Ok(()))) => {
+                let generation_time_ms = stream_started.elapsed().as_secs_f32() * 1000.0;
+                let audio_duration_secs = total_samples as f32 / sample_rate as f32;
+                let tokens_generated = total_samples / 256;
+                let rtf = if audio_duration_secs > 0.0 {
+                    (generation_time_ms / 1000.0) / audio_duration_secs
+                } else {
+                    0.0
+                };
+
+                let final_event = SpeechStreamEvent {
+                    event: "final",
+                    request_id: Some(stream_request_id.clone()),
+                    sequence: None,
+                    audio_base64: None,
+                    sample_count: None,
+                    is_final: None,
+                    sample_rate: None,
+                    audio_format: None,
+                    tokens_generated: Some(tokens_generated),
+                    generation_time_ms: Some(generation_time_ms),
+                    audio_duration_secs: Some(audio_duration_secs),
+                    rtf: Some(rtf),
+                    error: None,
+                };
+                let _ = event_tx.send(serde_json::to_string(&final_event).unwrap_or_default());
+            }
+            Ok(Ok(Err(err))) => {
+                let error_event = SpeechStreamEvent {
+                    event: "error",
+                    request_id: Some(stream_request_id.clone()),
+                    sequence: None,
+                    audio_base64: None,
+                    sample_count: None,
+                    is_final: None,
+                    sample_rate: None,
+                    audio_format: None,
+                    tokens_generated: None,
+                    generation_time_ms: None,
+                    audio_duration_secs: None,
+                    rtf: None,
+                    error: Some(err.to_string()),
+                };
+                let _ = event_tx.send(serde_json::to_string(&error_event).unwrap_or_default());
+            }
+            Ok(Err(_)) => {
+                let error_event = SpeechStreamEvent {
+                    event: "error",
+                    request_id: Some(stream_request_id.clone()),
+                    sequence: None,
+                    audio_base64: None,
+                    sample_count: None,
+                    is_final: None,
+                    sample_rate: None,
+                    audio_format: None,
+                    tokens_generated: None,
+                    generation_time_ms: None,
+                    audio_duration_secs: None,
+                    rtf: None,
+                    error: Some("Speech synthesis request timed out".to_string()),
+                };
+                let _ = event_tx.send(serde_json::to_string(&error_event).unwrap_or_default());
+            }
+            Err(err) => {
+                let error_event = SpeechStreamEvent {
+                    event: "error",
+                    request_id: Some(stream_request_id.clone()),
+                    sequence: None,
+                    audio_base64: None,
+                    sample_count: None,
+                    is_final: None,
+                    sample_rate: None,
+                    audio_format: None,
+                    tokens_generated: None,
+                    generation_time_ms: None,
+                    audio_duration_secs: None,
+                    rtf: None,
+                    error: Some(format!("Streaming task failed: {}", err)),
+                };
+                let _ = event_tx.send(serde_json::to_string(&error_event).unwrap_or_default());
+            }
+        }
+
+        let done_event = SpeechStreamEvent {
+            event: "done",
+            request_id: Some(stream_request_id),
+            sequence: None,
+            audio_base64: None,
+            sample_count: None,
+            is_final: None,
+            sample_rate: None,
+            audio_format: None,
+            tokens_generated: None,
+            generation_time_ms: None,
+            audio_duration_secs: None,
+            rtf: None,
+            error: None,
+        };
+        let _ = event_tx.send(serde_json::to_string(&done_event).unwrap_or_default());
     });
 
-    let encoder = izwi_core::audio::AudioEncoder::new(sample_rate, 1);
-    let stream = ReceiverStream::new(rx).map(move |chunk| {
-        let bytes = encoder.encode(&chunk.samples, format).unwrap_or_default();
-        Ok::<_, std::convert::Infallible>(bytes)
-    });
-
-    let content_type = izwi_core::audio::AudioEncoder::content_type(format);
+    let stream = async_stream::stream! {
+        while let Some(payload) = event_rx.recv().await {
+            yield Ok::<_, Infallible>(format!("data: {payload}\n\n"));
+        }
+    };
 
     Ok(Response::builder()
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::TRANSFER_ENCODING, "chunked")
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(stream))
         .unwrap())
 }
@@ -201,8 +442,16 @@ fn parse_response_format(format: &str) -> Result<AudioFormat, ApiError> {
         "raw_f32" | "pcm_f32" => Ok(AudioFormat::RawF32),
         "raw_i16" | "pcm_i16" => Ok(AudioFormat::RawI16),
         unsupported => Err(ApiError::bad_request(format!(
-            "Unsupported response_format: {}. Supported formats: wav, pcm",
+            "Unsupported response_format: {}. Supported formats: wav, pcm, raw_f32, raw_i16",
             unsupported
         ))),
+    }
+}
+
+fn stream_audio_format_label(format: AudioFormat) -> &'static str {
+    match format {
+        AudioFormat::Wav => "wav",
+        AudioFormat::RawF32 => "pcm_f32",
+        AudioFormat::RawI16 => "pcm_i16",
     }
 }

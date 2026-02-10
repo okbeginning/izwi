@@ -56,6 +56,34 @@ impl Default for TtsGenerationParams {
     }
 }
 
+/// Runtime configuration for progressive TTS audio emission.
+#[derive(Debug, Clone, Copy)]
+pub struct TtsStreamingConfig {
+    /// Minimum codec frames before emitting first audio chunk.
+    pub min_frames_before_stream: usize,
+    /// Minimum newly generated codec frames before decoding again.
+    pub decode_interval_frames: usize,
+    /// Keep a small decode lookahead to reduce boundary artifacts.
+    pub decode_lookahead_frames: usize,
+}
+
+impl Default for TtsStreamingConfig {
+    fn default() -> Self {
+        Self {
+            min_frames_before_stream: 6,
+            decode_interval_frames: 4,
+            decode_lookahead_frames: 2,
+        }
+    }
+}
+
+struct ProgressiveStreamState<'a> {
+    config: TtsStreamingConfig,
+    emitted_frames: usize,
+    emitted_samples: usize,
+    on_chunk: &'a mut dyn FnMut(Vec<f32>) -> Result<()>,
+}
+
 /// Batch input for CustomVoice (preset speaker) generation.
 #[derive(Debug, Clone)]
 pub struct BatchedSpeakerRequest {
@@ -228,10 +256,56 @@ impl Qwen3TtsModel {
             language_id,
             instruct_ids.as_deref(),
             params,
+            None,
         )?;
 
         // Decode to audio using speech tokenizer
         self.codec_to_audio(&codec_tokens)
+    }
+
+    /// Generate speech with progressive audio chunk callbacks.
+    pub fn generate_with_speaker_params_streaming(
+        &self,
+        text: &str,
+        speaker: &str,
+        language: Option<&str>,
+        instruct: Option<&str>,
+        params: &TtsGenerationParams,
+        stream_config: TtsStreamingConfig,
+        on_chunk: &mut dyn FnMut(Vec<f32>) -> Result<()>,
+    ) -> Result<()> {
+        info!("Streaming speech generation with speaker: {}", speaker);
+
+        let prompt_ids = self.encode_assistant_prompt_ids(text)?;
+        let speaker_id = self.tokenizer.get_speaker_id(speaker).ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "Unknown speaker '{speaker}'. Available speakers: {}",
+                self.tokenizer
+                    .available_speakers()
+                    .into_iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+        let language_id = self.resolve_language_id(language);
+        let instruct_ids = self.encode_instruction_ids(instruct)?;
+        let mut stream_state = ProgressiveStreamState {
+            config: stream_config,
+            emitted_frames: 0,
+            emitted_samples: 0,
+            on_chunk,
+        };
+
+        let _ = self.generate_codec_tokens_conditioned(
+            &prompt_ids,
+            Some(speaker_id),
+            language_id,
+            instruct_ids.as_deref(),
+            params,
+            Some(&mut stream_state),
+        )?;
+        Ok(())
     }
 
     /// Generate speech for a batch of preset-speaker requests.
@@ -331,10 +405,7 @@ impl Qwen3TtsModel {
                 continue;
             }
 
-            let embeds: Vec<Tensor> = group
-                .iter()
-                .map(|req| req.prefill_embeds.clone())
-                .collect();
+            let embeds: Vec<Tensor> = group.iter().map(|req| req.prefill_embeds.clone()).collect();
             let batch_embeds = Tensor::cat(&embeds, 0)?;
 
             let mut talker_cache = TalkerCache::new(self.talker.num_layers());
@@ -380,11 +451,7 @@ impl Qwen3TtsModel {
             }
 
             let mut offset = group[0].prefill_len;
-            let max_frames = states
-                .iter()
-                .map(|s| s.max_frames)
-                .max()
-                .unwrap_or(0);
+            let max_frames = states.iter().map(|s| s.max_frames).max().unwrap_or(0);
             let min_tokens_before_eos = 8usize;
 
             for frame_idx in 0..max_frames {
@@ -460,9 +527,11 @@ impl Qwen3TtsModel {
                 }
 
                 let batch_input = Tensor::cat(&step_inputs, 0)?;
-                let (batch_hidden, batch_logits) =
-                    self.talker
-                        .generate_step_with_embed(&batch_input, &mut talker_cache, offset)?;
+                let (batch_hidden, batch_logits) = self.talker.generate_step_with_embed(
+                    &batch_input,
+                    &mut talker_cache,
+                    offset,
+                )?;
 
                 for (idx, state) in states.iter_mut().enumerate() {
                     state.last_hidden = batch_hidden.i(idx)?.unsqueeze(0)?;
@@ -515,10 +584,49 @@ impl Qwen3TtsModel {
             &ref_codec_tokens,
             language_id,
             &params,
+            None,
         )?;
 
         // Decode to audio
         self.codec_to_audio(&codec_tokens)
+    }
+
+    /// Generate voice-cloned speech with progressive audio chunk callbacks.
+    pub fn generate_with_voice_clone_streaming(
+        &self,
+        text: &str,
+        reference: &SpeakerReference,
+        language: Option<&str>,
+        params: &TtsGenerationParams,
+        stream_config: TtsStreamingConfig,
+        on_chunk: &mut dyn FnMut(Vec<f32>) -> Result<()>,
+    ) -> Result<()> {
+        let ref_codec_tokens = self.encode_reference_audio(reference)?;
+        if ref_codec_tokens.is_empty() || ref_codec_tokens[0].is_empty() {
+            return Err(Error::ModelError(
+                "Voice cloning reference encoder produced no conditioning tokens".to_string(),
+            ));
+        }
+
+        let prompt_ids = self.encode_assistant_prompt_ids(text)?;
+        let ref_prompt_ids = self.encode_reference_prompt_ids(reference.text.as_str())?;
+        let language_id = self.resolve_language_id(language);
+        let mut stream_state = ProgressiveStreamState {
+            config: stream_config,
+            emitted_frames: 0,
+            emitted_samples: 0,
+            on_chunk,
+        };
+
+        let _ = self.generate_codec_tokens_voice_clone_conditioned(
+            &prompt_ids,
+            &ref_prompt_ids,
+            &ref_codec_tokens,
+            language_id,
+            params,
+            Some(&mut stream_state),
+        )?;
+        Ok(())
     }
 
     /// Generate speech without requiring a preset speaker table.
@@ -542,8 +650,40 @@ impl Qwen3TtsModel {
             language_id,
             instruct_ids.as_deref(),
             params,
+            None,
         )?;
         self.codec_to_audio(&codec_tokens)
+    }
+
+    /// Generate plain text speech with progressive audio chunk callbacks.
+    pub fn generate_with_text_params_streaming(
+        &self,
+        text: &str,
+        language: Option<&str>,
+        instruct: Option<&str>,
+        params: &TtsGenerationParams,
+        stream_config: TtsStreamingConfig,
+        on_chunk: &mut dyn FnMut(Vec<f32>) -> Result<()>,
+    ) -> Result<()> {
+        let prompt_ids = self.encode_assistant_prompt_ids(text)?;
+        let language_id = self.resolve_language_id(language);
+        let instruct_ids = self.encode_instruction_ids(instruct)?;
+        let mut stream_state = ProgressiveStreamState {
+            config: stream_config,
+            emitted_frames: 0,
+            emitted_samples: 0,
+            on_chunk,
+        };
+
+        let _ = self.generate_codec_tokens_conditioned(
+            &prompt_ids,
+            None,
+            language_id,
+            instruct_ids.as_deref(),
+            params,
+            Some(&mut stream_state),
+        )?;
+        Ok(())
     }
 
     fn resolve_language_id(&self, language: Option<&str>) -> Option<u32> {
@@ -720,6 +860,7 @@ impl Qwen3TtsModel {
         language_id: Option<u32>,
         instruct_ids: Option<&[u32]>,
         params: &TtsGenerationParams,
+        stream_state: Option<&mut ProgressiveStreamState<'_>>,
     ) -> Result<Vec<Vec<u32>>> {
         let prefill_embeds = self.build_conditioned_prefill_embeddings(
             prompt_ids,
@@ -754,6 +895,7 @@ impl Qwen3TtsModel {
             tts_pad_embed,
             max_frames,
             params,
+            stream_state,
         )
     }
 
@@ -764,6 +906,7 @@ impl Qwen3TtsModel {
         ref_codec_tokens: &[Vec<u32>],
         language_id: Option<u32>,
         params: &TtsGenerationParams,
+        stream_state: Option<&mut ProgressiveStreamState<'_>>,
     ) -> Result<Vec<Vec<u32>>> {
         let target_text_ids: Vec<u32> = if prompt_ids.len() > 8 {
             prompt_ids[3..prompt_ids.len() - 5].to_vec()
@@ -822,6 +965,7 @@ impl Qwen3TtsModel {
             tts_pad_embed,
             max_frames,
             params,
+            stream_state,
         )
     }
 
@@ -854,10 +998,8 @@ impl Qwen3TtsModel {
             let codec_pad_ids = vec![self.specials.codec_pad_id; text_lens];
             let codec_pad_embed = self.talker.get_codec_embedding_batch(&codec_pad_ids)?;
             let icl_input = text_embed.broadcast_add(&codec_pad_embed)?;
-            let icl_input = Tensor::cat(
-                &[&icl_input, &codec_embed.broadcast_add(tts_pad_embed)?],
-                1,
-            )?;
+            let icl_input =
+                Tensor::cat(&[&icl_input, &codec_embed.broadcast_add(tts_pad_embed)?], 1)?;
             return Ok((icl_input, tts_pad_embed.clone()));
         }
 
@@ -921,7 +1063,10 @@ impl Qwen3TtsModel {
                     % codec_vocab;
                 acoustic_codes.push(code);
             }
-            acoustic_embed_steps.push(self.code_predictor.get_acoustic_embeddings_sum(&acoustic_codes)?);
+            acoustic_embed_steps.push(
+                self.code_predictor
+                    .get_acoustic_embeddings_sum(&acoustic_codes)?,
+            );
         }
 
         let semantic_embed = self.talker.get_codec_embedding_batch(&semantic_codes)?;
@@ -942,6 +1087,7 @@ impl Qwen3TtsModel {
         tts_pad_embed: Tensor,
         max_frames: usize,
         params: &TtsGenerationParams,
+        mut stream_state: Option<&mut ProgressiveStreamState<'_>>,
     ) -> Result<Vec<Vec<u32>>> {
         let mut talker_cache = TalkerCache::new(self.talker.num_layers());
         let mut predictor_cache = CodePredictorCache::new(self.code_predictor.num_layers());
@@ -1018,9 +1164,72 @@ impl Qwen3TtsModel {
             last_hidden = new_hidden;
             last_logits = new_logits;
             offset += 1;
+
+            if let Some(state) = stream_state.as_deref_mut() {
+                self.maybe_emit_progressive_audio_chunk(&all_code_groups, state, false)?;
+            }
+        }
+
+        if let Some(state) = stream_state.as_deref_mut() {
+            self.maybe_emit_progressive_audio_chunk(&all_code_groups, state, true)?;
         }
 
         Ok(all_code_groups)
+    }
+
+    fn maybe_emit_progressive_audio_chunk(
+        &self,
+        codec_groups: &[Vec<u32>],
+        state: &mut ProgressiveStreamState<'_>,
+        force: bool,
+    ) -> Result<()> {
+        let total_frames = codec_groups.first().map(|g| g.len()).unwrap_or(0);
+        if total_frames == 0 {
+            return Ok(());
+        }
+
+        if !force {
+            if total_frames < state.config.min_frames_before_stream {
+                return Ok(());
+            }
+            let newly_generated = total_frames.saturating_sub(state.emitted_frames);
+            if newly_generated < state.config.decode_interval_frames {
+                return Ok(());
+            }
+        }
+
+        let lookahead = if force {
+            0
+        } else {
+            state.config.decode_lookahead_frames
+        };
+        let target_frames = total_frames.saturating_sub(lookahead);
+        if target_frames <= state.emitted_frames {
+            return Ok(());
+        }
+
+        let mut partial_tokens = Vec::with_capacity(codec_groups.len());
+        for group in codec_groups {
+            if group.len() < target_frames {
+                return Ok(());
+            }
+            partial_tokens.push(group[..target_frames].to_vec());
+        }
+
+        let decoded = self.codec_to_audio(&partial_tokens)?;
+        if decoded.len() <= state.emitted_samples {
+            state.emitted_frames = target_frames;
+            return Ok(());
+        }
+
+        let new_samples = decoded[state.emitted_samples..].to_vec();
+        state.emitted_samples = decoded.len();
+        state.emitted_frames = target_frames;
+        if !new_samples.is_empty() {
+            (state.on_chunk)(new_samples)?;
+        }
+
+        Ok(())
     }
 
     fn build_conditioned_prefill_embeddings(
