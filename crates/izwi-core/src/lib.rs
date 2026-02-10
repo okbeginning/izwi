@@ -22,6 +22,7 @@
 //! let request = EngineCoreRequest::tts("Hello, world!");
 //! let output = engine.generate(request).await?;
 //! ```
+#![allow(dead_code)]
 
 pub mod audio;
 pub mod backends;

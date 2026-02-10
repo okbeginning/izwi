@@ -12,7 +12,6 @@ use candle_core::quantized::QTensor;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
