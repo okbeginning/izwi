@@ -59,7 +59,7 @@ function App() {
   >({});
 
   // Use ref to track polling state and active downloads
-  const pollingRef = useRef<NodeJS.Timeout | null>(null);
+  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const activeDownloadsRef = useRef<Set<string>>(new Set());
   const activeModelLoadsRef = useRef<Set<string>>(new Set());
   const eventSourcesRef = useRef<Record<string, EventSource>>({});
