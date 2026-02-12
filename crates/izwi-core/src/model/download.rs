@@ -194,7 +194,7 @@ impl ModelDownloader {
         let response = self
             .http_client
             .get(&url)
-            .header("User-Agent", "izwi-audio/0.1.0-alpha-6")
+            .header("User-Agent", "izwi-audio/0.1.0-alpha-7")
             .send()
             .await
             .map_err(|e| Error::HfHubError(format!("Repo tree request failed: {}", e)))?;
