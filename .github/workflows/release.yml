@@ -112,21 +112,30 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --locked --version "^2.0"
 
-      - name: Build desktop bundle (unsigned/default)
-        if: runner.os != 'macOS' || env.APPLE_SIGNING_IDENTITY == ''
+      - name: Build desktop bundle (Linux)
+        if: runner.os == 'Linux'
         env:
           CI: "true"
         run: |
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            cargo tauri build \
-              --manifest-path crates/izwi-desktop/Cargo.toml \
-              --bundles ${{ matrix.bundle_kind }} \
-              --config crates/izwi-desktop/tauri.macos.conf.json
-          else
-            cargo tauri build \
-              --manifest-path crates/izwi-desktop/Cargo.toml \
-              --bundles ${{ matrix.bundle_kind }}
-          fi
+          cargo tauri build \
+            --bundles ${{ matrix.bundle_kind }}
+
+      - name: Build desktop bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CI: "true"
+        run: |
+          cargo tauri build --bundles ${{ matrix.bundle_kind }}
+
+      - name: Build desktop bundle (unsigned macOS)
+        if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY == ''
+        env:
+          CI: "true"
+        run: |
+          cargo tauri build \
+            --bundles ${{ matrix.bundle_kind }} \
+            --config crates/izwi-desktop/tauri.macos.conf.json
 
       - name: Build desktop bundle (signed macOS)
         if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY != ''
@@ -134,7 +143,6 @@ jobs:
           CI: "true"
         run: |
           cargo tauri build \
-            --manifest-path crates/izwi-desktop/Cargo.toml \
             --bundles ${{ matrix.bundle_kind }} \
             --config crates/izwi-desktop/tauri.macos.conf.json
 
