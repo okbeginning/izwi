@@ -170,3 +170,48 @@ not native FP8 execution.
 - [Voice Mode](/features/voice)
 - [Models](/models)
 - [CLI Reference](/cli)
+
+## CUDA concurrent chat
+
+Qwen3.8 batches independent CUDA chat requests through one loaded model by default.
+The incremental admission policy grows cache reservations with active sequences
+and can suspend and replay a request when the shared cache is under pressure. It preserves automatic
+output limits and already streamed text. Capacity is derived from the device's
+memory and model state, rather than a GPU model name.
+
+Use your normal CUDA server command; no environment flag is needed. The policy
+also enables scheduler-visible chunked prefill for resumable adapters. To opt out
+and return to conservative admission, set this before restarting the server:
+
+```bash
+export IZWI_CUDA_INCREMENTAL_CHAT=0
+```
+
+Set it to `1` or remove the variable to restore the default.
+Other model families keep their existing admission policy until they implement the
+published-sequence replay contract.
+
+Use separate conversations, or independent `/v1/chat/completions` requests, for
+concurrent answers. Sends to the same conversation remain ordered. The playground
+allows one active stream per mounted view; separate tabs can use separate conversations.
+
+Inspect `/v1/health` for the effective `runtime.chat_concurrency_policy`, and
+`/v1/metrics` for actual model batch widths, cache claims, suspensions and replay
+work. Open HTTP streams alone do not establish concurrent model execution. Heavy
+cache pressure can still queue or suspend requests; simultaneous maximum-length
+histories must fit the available state budget.
+
+Temporary batch workspace pressure is also handled before model execution: the
+scheduler reduces batch width or resumable prefill size and retries the same
+request without repeating streamed output. Under persistent pressure it can
+suspend eligible Qwen3.8 requests. Progress from competing work keeps waiting
+requests eligible; repeated failures with no progress still return an explicit
+capacity error. Requests that cannot fit alone cannot be guaranteed to finish.
+Capacity diagnostics group pending reservations by owner class to distinguish
+model, request, and workspace promises from materialized memory.
+
+For a controlled hardware acceptance run, use
+`scripts/bench/run-cuda-chat-concurrency.py` as documented in
+`scripts/bench/README.md`. It checks uncapped requests through both API routes,
+staggered arrivals, cancellation, overlapping output, actual multirow forwards,
+and resource release. CPU tests do not certify CUDA throughput or numerical behavior.

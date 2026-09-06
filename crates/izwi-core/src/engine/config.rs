@@ -61,6 +61,9 @@ pub(crate) fn tts_explicit_output_limit(
 /// Configuration for the engine core.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineCoreConfig {
+    /// Performance policy, resolved once before model loading.
+    #[serde(default)]
+    pub performance: crate::performance::PerformanceConfig,
     /// Directory containing models
     #[serde(default = "default_models_dir")]
     pub models_dir: PathBuf,
@@ -146,6 +149,11 @@ pub struct EngineCoreConfig {
     /// Enable chunked prefill for long prompts
     #[serde(default = "default_chunked_prefill")]
     pub enable_chunked_prefill: bool,
+
+    /// Default-on CUDA admission for replay-capable Qwen3.8 requests.
+    /// Operators can disable it with IZWI_CUDA_INCREMENTAL_CHAT=0.
+    #[serde(default = "default_cuda_incremental_chat")]
+    pub enable_cuda_incremental_chat: bool,
 
     /// Threshold for chunked prefill (tokens)
     #[serde(default = "default_chunked_prefill_threshold")]
@@ -260,6 +268,14 @@ fn default_kv_cache_dtype() -> String {
 fn default_max_blocks() -> usize {
     1024
 }
+fn default_cuda_incremental_chat() -> bool {
+    cuda_incremental_chat_from_env(std::env::var("IZWI_CUDA_INCREMENTAL_CHAT").ok().as_deref())
+}
+
+fn cuda_incremental_chat_from_env(value: Option<&str>) -> bool {
+    value.is_none_or(|value| matches!(value, "1" | "true" | "on"))
+}
+
 fn default_chunked_prefill() -> bool {
     false
 }
@@ -364,6 +380,7 @@ fn default_max_prefix_cache_pages() -> usize {
 impl Default for EngineCoreConfig {
     fn default() -> Self {
         Self {
+            performance: Default::default(),
             models_dir: default_models_dir(),
             max_batch_size: default_max_batch_size(),
             max_tensor_batch_size: BatchSizePreference::Auto,
@@ -384,6 +401,7 @@ impl Default for EngineCoreConfig {
             managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
             max_prefix_cache_pages: default_max_prefix_cache_pages(),
             enable_chunked_prefill: default_chunked_prefill(),
+            enable_cuda_incremental_chat: default_cuda_incremental_chat(),
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
             sample_rate: default_sample_rate(),
             num_codebooks: default_num_codebooks(),
@@ -411,6 +429,14 @@ impl Default for EngineCoreConfig {
 }
 
 impl EngineCoreConfig {
+    pub fn cuda_incremental_chat_enabled(&self) -> bool {
+        self.backend == BackendKind::Cuda && self.enable_cuda_incremental_chat
+    }
+
+    pub(crate) fn effective_chunked_prefill(&self) -> bool {
+        self.enable_chunked_prefill || self.cuda_incremental_chat_enabled()
+    }
+
     /// Resolve rollout-aware dispatch and physical-launch capacity axes.
     pub fn resolved_physical_execution_capacity(&self) -> PhysicalExecutionCapacity {
         self.physical_execution_mode
@@ -469,6 +495,42 @@ mod managed_kv_default_tests {
         KvCacheDtype, PhysicalExecutionMode, PhysicalInFlightLimit, PrefixCachePolicy,
     };
     use crate::model::ModelVariant;
+
+    #[test]
+    fn incremental_chat_defaults_on_and_preserves_explicit_opt_out() {
+        assert!(super::cuda_incremental_chat_from_env(None));
+        for value in ["1", "true", "on"] {
+            assert!(super::cuda_incremental_chat_from_env(Some(value)));
+        }
+        for value in ["0", "false", "off", "", "invalid"] {
+            assert!(!super::cuda_incremental_chat_from_env(Some(value)));
+        }
+    }
+
+    #[test]
+    fn incremental_chat_rollout_requires_cuda_and_enables_resumable_prefill() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let mut config = EngineCoreConfig {
+                backend,
+                enable_cuda_incremental_chat: true,
+                enable_chunked_prefill: false,
+                ..Default::default()
+            };
+            assert_eq!(
+                config.cuda_incremental_chat_enabled(),
+                backend == BackendKind::Cuda
+            );
+            assert_eq!(
+                config.effective_chunked_prefill(),
+                backend == BackendKind::Cuda
+            );
+            config.enable_cuda_incremental_chat = false;
+            assert!(!config.cuda_incremental_chat_enabled());
+            assert!(!config.effective_chunked_prefill());
+            config.enable_chunked_prefill = true;
+            assert!(config.effective_chunked_prefill());
+        }
+    }
 
     #[test]
     fn managed_prefix_reuse_is_disabled_by_default() {

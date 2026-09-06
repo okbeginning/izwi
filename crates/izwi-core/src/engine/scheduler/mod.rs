@@ -134,7 +134,7 @@ impl From<&EngineCoreConfig> for SchedulerConfig {
             max_batch_size: config.max_batch_size,
             max_tokens_per_step: config.max_tokens_per_step,
             policy: config.scheduling_policy,
-            enable_chunked_prefill: config.enable_chunked_prefill,
+            enable_chunked_prefill: config.effective_chunked_prefill(),
             chunked_prefill_threshold: config.chunked_prefill_threshold,
             enable_preemption: config.enable_preemption,
             enable_vad_preemption: true, // Default to enabled for audio apps
@@ -522,6 +522,17 @@ struct RequestMetadata {
     max_tokens: usize,
     cache_policy: RequestCachePolicy,
     retry_not_before: Option<Instant>,
+    replay_prompt_tokens: Option<usize>,
+    capacity_blocked_on: Option<SessionKey>,
+    /// Retained per-session bound after a pre-execution workspace rejection.
+    workspace_prefill_token_cap: Option<usize>,
+}
+
+impl RequestMetadata {
+    fn prefill_tokens(&self) -> usize {
+        self.replay_prompt_tokens
+            .unwrap_or(self.total_prompt_tokens)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -532,6 +543,7 @@ struct RequestCachePolicy {
     recompute_safe: bool,
     cache_release_safe: bool,
     preferred_decode_tokens: usize,
+    sustained_decode_quantum: bool,
 }
 
 impl Default for RequestCachePolicy {
@@ -545,6 +557,7 @@ impl Default for RequestCachePolicy {
             recompute_safe: false,
             cache_release_safe: false,
             preferred_decode_tokens: 1,
+            sustained_decode_quantum: false,
         }
     }
 }
@@ -675,6 +688,9 @@ impl Scheduler {
             max_tokens,
             cache_policy: RequestCachePolicy::default(),
             retry_not_before: None,
+            replay_prompt_tokens: None,
+            capacity_blocked_on: None,
+            workspace_prefill_token_cap: None,
         };
 
         self.requests.insert(request.id.clone(), metadata);
@@ -719,6 +735,9 @@ impl Scheduler {
                 max_tokens: usize::MAX,
                 cache_policy: RequestCachePolicy::default(),
                 retry_not_before: None,
+                replay_prompt_tokens: None,
+                capacity_blocked_on: None,
+                workspace_prefill_token_cap: None,
             },
         );
         self.running.insert(
@@ -869,6 +888,7 @@ impl Scheduler {
             recompute_safe: profile.recompute_safe,
             cache_release_safe: profile.cache_release_safe,
             preferred_decode_tokens: profile.preferred_decode_tokens.max(1),
+            sustained_decode_quantum: profile.effective_sustained_decode_quantum(),
         };
         true
     }
@@ -1033,6 +1053,9 @@ impl Scheduler {
             })
             .filter_map(|(id, running)| {
                 let metadata = self.requests.get(id)?;
+                if self.capacity_waiting(metadata) {
+                    return None;
+                }
                 if metadata
                     .retry_not_before
                     .is_some_and(|not_before| not_before > scheduling_now)
@@ -1082,6 +1105,9 @@ impl Scheduler {
             .filter(|(id, _)| !self.realtime_sessions.contains_key(*id))
             .filter_map(|(id, r)| {
                 let metadata = self.requests.get(id)?;
+                if self.capacity_waiting(metadata) {
+                    return None;
+                }
                 if metadata
                     .retry_not_before
                     .is_some_and(|not_before| not_before > scheduling_now)
@@ -1106,6 +1132,7 @@ impl Scheduler {
                     overdue_ms,
                     metadata.cache_policy.decode_batch == NativeBatchMode::Continuous,
                     metadata.cache_policy.preferred_decode_tokens,
+                    metadata.cache_policy.sustained_decode_quantum,
                 ))
             })
             .collect();
@@ -1181,6 +1208,7 @@ impl Scheduler {
             overdue_ms,
             continuous_decode,
             preferred_decode_tokens,
+            sustained_decode_quantum,
         ) in decode_candidates
         {
             if self.config.enable_preemption
@@ -1209,10 +1237,33 @@ impl Scheduler {
                 workload_class,
                 preferred_decode_tokens,
                 continuous_decode,
+                sustained_decode_quantum,
             );
             if num_tokens == 0 {
                 continue;
             }
+
+            let quantum_reason = if num_tokens > 1 {
+                "model_preference"
+            } else if remaining_decode_budget <= 1 || remaining_decode_tokens <= 1 {
+                "token_budget"
+            } else if self.waiting_count() > 0 || self.running.len() > 1 {
+                "peer_fairness"
+            } else if overdue_ms > 0.0 && !sustained_decode_quantum {
+                "soft_deadline"
+            } else if preferred_decode_tokens <= 1 {
+                "scalar_model_policy"
+            } else {
+                "workload_policy"
+            };
+            debug!(
+                request_id = %request_id,
+                granted_tokens = num_tokens,
+                preferred_tokens = preferred_decode_tokens,
+                quantum_reason,
+                sustained_decode_quantum,
+                "Decode quantum granted"
+            );
 
             if let Some(running) = self.running.get_mut(&request_id) {
                 running.paused = false;
@@ -1295,6 +1346,9 @@ impl Scheduler {
             .filter(|(_, r)| !r.prefill_complete && !r.prefill_in_flight)
             .filter_map(|(id, r)| {
                 let metadata = self.requests.get(id)?;
+                if self.capacity_waiting(metadata) {
+                    return None;
+                }
                 if metadata
                     .retry_not_before
                     .is_some_and(|not_before| not_before > scheduling_now)
@@ -1321,7 +1375,7 @@ impl Scheduler {
                 None => continue,
             };
 
-            let remaining_prompt = metadata.total_prompt_tokens.saturating_sub(num_computed);
+            let remaining_prompt = metadata.prefill_tokens().saturating_sub(num_computed);
             if remaining_prompt == 0 {
                 if let Some(running) = self.running.get_mut(&request_id) {
                     running.prefill_complete = true;
@@ -1356,7 +1410,9 @@ impl Scheduler {
                 }
                 scheduling_full_prefill_batch = true;
             } else {
-                target_tokens = target_tokens.min(remaining_prefill_budget);
+                target_tokens = target_tokens
+                    .min(remaining_prefill_budget)
+                    .min(metadata.workspace_prefill_token_cap.unwrap_or(usize::MAX));
             }
             if target_tokens == 0 {
                 continue;
@@ -1440,7 +1496,7 @@ impl Scheduler {
                 deferred_waiting.push(request_id);
                 continue;
             }
-            let mut target_tokens = metadata.total_prompt_tokens;
+            let mut target_tokens = metadata.prefill_tokens();
 
             // Apply chunked prefill if enabled and prompt is long
             if !full_prefill
@@ -1461,7 +1517,9 @@ impl Scheduler {
                 }
                 scheduling_full_prefill_batch = true;
             } else {
-                target_tokens = target_tokens.min(remaining_prefill_budget);
+                target_tokens = target_tokens
+                    .min(remaining_prefill_budget)
+                    .min(metadata.workspace_prefill_token_cap.unwrap_or(usize::MAX));
             }
             if target_tokens == 0 {
                 break;
@@ -1567,7 +1625,7 @@ impl Scheduler {
 
             // Check if prefill is now complete
             if let Some(metadata) = self.requests.get(request_id) {
-                if running.num_tokens_processed >= metadata.total_prompt_tokens {
+                if running.num_tokens_processed >= metadata.prefill_tokens() {
                     running.prefill_complete = true;
                 }
 
@@ -1927,7 +1985,7 @@ impl Scheduler {
 
         running.prefill_in_flight = false;
         running.finalize_in_flight = false;
-        running.prefill_complete = running.num_tokens_processed >= metadata.total_prompt_tokens;
+        running.prefill_complete = running.num_tokens_processed >= metadata.prefill_tokens();
         true
     }
 
@@ -1957,6 +2015,34 @@ impl Scheduler {
         true
     }
 
+    /// Shrink only a resumable prefill after workspace admission rejected an
+    /// unstarted quantum. The bound survives retries and replay, but never
+    /// changes the logical prompt, committed cursor, or generation budget.
+    pub(crate) fn reduce_workspace_prefill_quantum(
+        &mut self,
+        session: &SessionKey,
+        failed_tokens: usize,
+    ) -> bool {
+        let Some(metadata) = self.requests.get_mut(&session.request_id) else {
+            return false;
+        };
+        if metadata.sequence_id != session.epoch
+            || metadata.cache_policy.prefill != PrefillMode::Incremental
+            || failed_tokens <= 1
+        {
+            return false;
+        }
+        let reduced = (failed_tokens / 2).max(1);
+        if metadata
+            .workspace_prefill_token_cap
+            .is_some_and(|current| current <= reduced)
+        {
+            return false;
+        }
+        metadata.workspace_prefill_token_cap = Some(reduced);
+        true
+    }
+
     /// Defer the next execution quantum for an exact session. This clears an
     /// uncommitted prefill marker without changing committed progress.
     pub(crate) fn defer_execution_retry(
@@ -1981,6 +2067,90 @@ impl Scheduler {
         true
     }
 
+    fn capacity_waiting(&self, metadata: &RequestMetadata) -> bool {
+        metadata.capacity_blocked_on.as_ref().is_some_and(|owner| {
+            self.requests
+                .get(&owner.request_id)
+                .is_some_and(|m| m.sequence_id == owner.epoch)
+        })
+    }
+
+    /// Suspend a published sequence without changing generation/output counters.
+    pub(crate) fn suspend_for_replay(
+        &mut self,
+        session: &SessionKey,
+        replay_tokens: usize,
+        survivor: SessionKey,
+    ) -> bool {
+        let Some(metadata) = self.requests.get_mut(&session.request_id) else {
+            return false;
+        };
+        let Some(running) = self.running.get_mut(&session.request_id) else {
+            return false;
+        };
+        if metadata.sequence_id != session.epoch || running.sequence_id != session.epoch {
+            return false;
+        }
+        metadata.replay_prompt_tokens = Some(replay_tokens.max(metadata.total_prompt_tokens));
+        metadata.capacity_blocked_on = Some(survivor);
+        running.num_tokens_processed = 0;
+        running.prefill_complete = false;
+        running.prefill_in_flight = false;
+        running.finalize_pending = false;
+        running.finalize_in_flight = false;
+        running.paused = true;
+        true
+    }
+
+    /// A single priority/age order governs both survivor and victim selection,
+    /// so a younger high-priority request cannot deadlock behind a protected owner.
+    pub(crate) fn capacity_survivor(
+        &self,
+        candidates: impl IntoIterator<Item = SessionKey>,
+    ) -> Option<SessionKey> {
+        candidates
+            .into_iter()
+            .filter(|candidate| {
+                self.requests
+                    .get(&candidate.request_id)
+                    .is_some_and(|metadata| metadata.sequence_id == candidate.epoch)
+            })
+            .max_by_key(|candidate| {
+                (
+                    self.requests[&candidate.request_id].priority,
+                    std::cmp::Reverse(candidate.epoch),
+                )
+            })
+    }
+
+    /// Protect the older equal-priority request. Victims remain suspended until
+    /// that exact survivor leaves, avoiding repeated eviction/replay oscillation.
+    pub(crate) fn published_capacity_victim(
+        &self,
+        candidates: impl IntoIterator<Item = SessionKey>,
+        survivor: &SessionKey,
+    ) -> Option<SessionKey> {
+        let owner = self.requests.get(&survivor.request_id)?;
+        candidates
+            .into_iter()
+            .filter(|candidate| {
+                let Some(meta) = self.requests.get(&candidate.request_id) else {
+                    return false;
+                };
+                let Some(running) = self.running.get(&candidate.request_id) else {
+                    return false;
+                };
+                candidate.epoch == meta.sequence_id
+                    && candidate.epoch == running.sequence_id
+                    && running.prefill_complete
+                    && !running.finalize_in_flight
+                    && !self.capacity_waiting(meta)
+                    && (meta.priority < owner.priority
+                        || meta.priority == owner.priority && meta.sequence_id > owner.sequence_id)
+            })
+            .max_by_key(|candidate| candidate.epoch)
+    }
+
     /// Restart an exact running request incarnation from prefill after an
     /// executor reports that its session must be recomputed.
     pub fn restart_request_for_recompute(&mut self, session: &SessionKey) -> bool {
@@ -1988,6 +2158,12 @@ impl Scheduler {
             return false;
         };
         if metadata.sequence_id != session.epoch {
+            return false;
+        }
+
+        // A capacity replay preserves already published output. If its state
+        // is lost, fail the request rather than restarting and duplicating it.
+        if metadata.replay_prompt_tokens.is_some() {
             return false;
         }
 
@@ -2577,6 +2753,7 @@ impl Scheduler {
         workload_class: WorkloadClass,
         preferred_decode_tokens: usize,
         continuous_decode: bool,
+        sustained_decode_quantum: bool,
     ) -> usize {
         let base = remaining_decode_budget.min(remaining_request_tokens).max(1);
         let preferred_decode_tokens = preferred_decode_tokens.max(1);
@@ -2589,7 +2766,7 @@ impl Scheduler {
                     .count()
                     == 1
                 && !has_waiting_work
-                && overdue_ms <= 0.0;
+                && (overdue_ms <= 0.0 || sustained_decode_quantum);
             if exact_solo && preferred_decode_tokens > 1 {
                 return preferred_decode_tokens.min(base).max(1);
             }
@@ -2602,7 +2779,7 @@ impl Scheduler {
             return 1.min(base);
         }
         let active_decode_requests = self.running.values().filter(|r| r.prefill_complete).count();
-        if has_waiting_work || overdue_ms > 0.0 {
+        if has_waiting_work || (overdue_ms > 0.0 && !sustained_decode_quantum) {
             return 1.min(base);
         }
         if active_decode_requests > 1 {
@@ -2679,6 +2856,7 @@ impl Scheduler {
                 && !running.prefill_in_flight
                 && self.requests.get(request_id).is_some_and(|metadata| {
                     metadata.cache_policy.prefill == PrefillMode::Full
+                        && !self.capacity_waiting(metadata)
                         && metadata.retry_not_before.is_none_or(|retry| retry <= now)
                 })
         });
@@ -2686,6 +2864,7 @@ impl Scheduler {
             || self.waiting_members.iter().any(|request_id| {
                 self.requests.get(request_id).is_some_and(|metadata| {
                     metadata.cache_policy.prefill == PrefillMode::Full
+                        && !self.capacity_waiting(metadata)
                         && metadata.retry_not_before.is_none_or(|retry| retry <= now)
                 })
             })
@@ -2711,6 +2890,7 @@ impl Scheduler {
                 && !running.prefill_in_flight
                 && self.requests.get(request_id).is_some_and(|metadata| {
                     metadata.cache_policy.prefill == PrefillMode::Incremental
+                        && !self.capacity_waiting(metadata)
                         && metadata.retry_not_before.is_none_or(|retry| retry <= now)
                 })
         });
@@ -2718,6 +2898,7 @@ impl Scheduler {
             || self.waiting_members.iter().any(|request_id| {
                 self.requests.get(request_id).is_some_and(|metadata| {
                     metadata.cache_policy.prefill == PrefillMode::Incremental
+                        && !self.capacity_waiting(metadata)
                         && metadata.retry_not_before.is_none_or(|retry| retry <= now)
                 })
             })
@@ -2942,6 +3123,52 @@ mod tests {
         profile.cache_mode = CacheMode::ExternalPaged;
         assert!(scheduler
             .update_execution_profile(&SessionKey::new(request_id.to_string(), epoch), &profile));
+    }
+
+    #[test]
+    fn capacity_survivor_priority_order_prevents_published_owner_deadlock() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 4,
+            max_tokens_per_step: 1024,
+            enable_adaptive_batching: false,
+            enable_chunked_prefill: false,
+            ..Default::default()
+        });
+        let low = build_request(TaskType::Chat, "older-low", Priority::Low);
+        let high = build_request(TaskType::Chat, "newer-high", Priority::High);
+        let peer = build_request(TaskType::Chat, "newest-high", Priority::High);
+        for request in [&low, &high, &peer] {
+            assert!(scheduler.add_request(request));
+        }
+        scheduler.schedule();
+        for request in [&low, &high, &peer] {
+            scheduler.update_after_step(&request.id, request.num_prompt_tokens(), 1, 1.0);
+        }
+        let session = |request: &EngineCoreRequest| {
+            SessionKey::new(
+                request.id.clone(),
+                scheduler.get_sequence_id(&request.id).unwrap(),
+            )
+        };
+        let low_session = session(&low);
+        let high_session = session(&high);
+        let peer_session = session(&peer);
+        let survivor = scheduler
+            .capacity_survivor([
+                low_session.clone(),
+                peer_session.clone(),
+                high_session.clone(),
+            ])
+            .unwrap();
+        assert_eq!(survivor, high_session);
+        assert_eq!(
+            scheduler.published_capacity_victim([low_session.clone()], &survivor),
+            Some(low_session)
+        );
+        assert_eq!(
+            scheduler.published_capacity_victim([peer_session.clone()], &survivor),
+            Some(peer_session)
+        );
     }
 
     #[test]
@@ -3327,6 +3554,26 @@ mod tests {
     }
 
     #[test]
+    fn failed_capacity_replay_cannot_restart_published_output() {
+        let mut scheduler = Scheduler::new(SchedulerConfig::default());
+        let request = build_request(TaskType::Chat, "published-replay", Priority::Normal);
+        scheduler.add_request(&request);
+        let session = scheduler.schedule().prefill_requests[0].session_key();
+        scheduler
+            .requests
+            .get_mut(&request.id)
+            .unwrap()
+            .replay_prompt_tokens = Some(8);
+        let running = scheduler.running.get_mut(&request.id).unwrap();
+        running.num_tokens_generated = 3;
+        running.first_token_emitted = true;
+        assert!(!scheduler.restart_request_for_recompute(&session));
+        let running = &scheduler.running[&request.id];
+        assert_eq!(running.num_tokens_generated, 3);
+        assert!(running.first_token_emitted);
+    }
+
+    #[test]
     fn recompute_restart_preserves_session_metadata_and_restarts_prefill() {
         let mut scheduler = Scheduler::new(SchedulerConfig {
             max_batch_size: 1,
@@ -3571,6 +3818,92 @@ mod tests {
         let retry = scheduler.schedule();
         assert_eq!(retry.prefill_requests.len(), 1);
         assert_eq!(retry.prefill_requests[0].session_key(), session);
+    }
+
+    #[test]
+    fn workspace_prefill_retry_shrinks_at_the_committed_cursor() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 8,
+            min_tokens_per_step: 1,
+            enable_chunked_prefill: true,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let mut request = build_request(TaskType::Chat, "workspace-retry", Priority::Normal);
+        request.prompt_tokens = vec![7; 32];
+        assert!(scheduler.add_request(&request));
+        allow_incremental_prefill(&mut scheduler, &request.id);
+        let first = scheduler.schedule().prefill_requests.remove(0);
+        let session = first.session_key();
+        assert_eq!(first.num_tokens, 8);
+        scheduler.update_after_step(&request.id, 8, 0, 1.0);
+        let failed = scheduler.schedule().prefill_requests.remove(0);
+        assert_eq!(failed.num_computed_tokens, 8);
+        assert_eq!(failed.num_tokens, 8);
+        let logical_prompt = scheduler.requests[&request.id].total_prompt_tokens;
+        let generation_budget = scheduler.requests[&request.id].max_tokens;
+        assert!(scheduler.reduce_workspace_prefill_quantum(&session, failed.num_tokens));
+        assert!(scheduler.defer_execution_retry(&session, Instant::now()));
+        let retry = scheduler.schedule().prefill_requests.remove(0);
+        assert_eq!(retry.num_computed_tokens, 8);
+        assert_eq!(retry.num_tokens, 4);
+        assert_eq!(
+            scheduler.requests[&request.id].total_prompt_tokens,
+            logical_prompt
+        );
+        assert_eq!(scheduler.requests[&request.id].max_tokens, generation_budget);
+        assert_eq!(scheduler.running[&request.id].num_tokens_generated, 0);
+        scheduler.update_after_step(&request.id, 4, 0, 1.0);
+        let subsequent = scheduler.schedule().prefill_requests.remove(0);
+        assert_eq!(subsequent.num_computed_tokens, 12);
+        assert_eq!(
+            subsequent.num_tokens, 4,
+            "retain the learned bound after progress"
+        );
+        assert!(scheduler.reduce_workspace_prefill_quantum(&session, 3));
+        assert!(scheduler.defer_execution_retry(&session, Instant::now()));
+        assert_eq!(scheduler.schedule().prefill_requests[0].num_tokens, 1);
+        assert!(!scheduler.reduce_workspace_prefill_quantum(&session, 1));
+        assert!(!scheduler.reduce_workspace_prefill_quantum(&session, 0));
+    }
+
+    #[test]
+    fn workspace_prefill_cap_applies_to_waiting_requests_and_fences_epochs() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 8,
+            min_tokens_per_step: 1,
+            enable_chunked_prefill: true,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let mut request = build_request(TaskType::Chat, "workspace-waiting", Priority::Normal);
+        request.prompt_tokens = vec![7; 16];
+        assert!(scheduler.add_request(&request));
+        let session = SessionKey::new(
+            request.id.clone(),
+            scheduler.requests[&request.id].sequence_id,
+        );
+        assert!(
+            !scheduler.reduce_workspace_prefill_quantum(&session, 8),
+            "full prefill cannot shrink"
+        );
+        allow_incremental_prefill(&mut scheduler, &request.id);
+        let stale = SessionKey::new(request.id.clone(), session.epoch.saturating_add(1));
+        assert!(!scheduler.reduce_workspace_prefill_quantum(&stale, 8));
+        assert_eq!(
+            scheduler.requests[&request.id].workspace_prefill_token_cap,
+            None
+        );
+        assert!(scheduler.reduce_workspace_prefill_quantum(&session, 8));
+        assert!(
+            !scheduler.reduce_workspace_prefill_quantum(&session, 16),
+            "never enlarge a retained cap"
+        );
+        let first = scheduler.schedule().prefill_requests.remove(0);
+        assert_eq!(first.num_computed_tokens, 0);
+        assert_eq!(first.num_tokens, 4);
     }
 
     #[test]
@@ -4233,6 +4566,125 @@ mod tests {
         let decode = scheduler.schedule();
         assert_eq!(decode.decode_requests.len(), 1);
         assert_eq!(decode.decode_requests[0].num_tokens, 4);
+    }
+
+    #[test]
+    fn sustained_cuda_quantum_survives_soft_sla_only_with_loaded_opt_in() {
+        for (backend, loaded, enabled, expected) in [
+            (BackendKind::Cuda, true, true, 2),
+            (BackendKind::Cuda, true, false, 1),
+            (BackendKind::Cuda, false, true, 1),
+            (BackendKind::Cpu, true, true, 1),
+            (BackendKind::Metal, true, true, 1),
+        ] {
+            let mut scheduler = Scheduler::new(SchedulerConfig {
+                max_batch_size: 2,
+                max_tokens_per_step: 8,
+                min_tokens_per_step: 1,
+                policy: SchedulingPolicy::FCFS,
+                enable_chunked_prefill: false,
+                enable_adaptive_batching: false,
+                enable_decode_quanta: false,
+                ..Default::default()
+            });
+            let id = "sustained-soft-sla".to_string();
+            let mut request = build_request(TaskType::Chat, &id, Priority::Normal);
+            request.workload_class = WorkloadClass::Streaming;
+            assert!(scheduler.add_request(&request));
+            let epoch = scheduler.get_sequence_id(&id).unwrap();
+            let mut profile = ExecutionProfile::fail_closed(backend, None, ExecutionMode::Sequence);
+            profile.prefill = PrefillMode::Full;
+            profile.incremental_decode = true;
+            profile.decode_batch = NativeBatchMode::Continuous;
+            profile.preferred_decode_tokens = 2;
+            profile.sustained_decode_quantum = enabled;
+            profile.resolved_from_loaded_model = loaded;
+            assert!(
+                scheduler.update_execution_profile(&SessionKey::new(id.clone(), epoch), &profile)
+            );
+            assert_eq!(scheduler.schedule().prefill_requests.len(), 1);
+            scheduler.update_after_step(&id, request.num_prompt_tokens(), 1, 1.0);
+            // Move the soft deadline instead of sleeping: prefill may already
+            // have consumed the entire interactive/streaming SLA in production.
+            scheduler.requests.get_mut(&id).unwrap().deadline_at =
+                Instant::now() - Duration::from_millis(750);
+            let scheduled = scheduler.schedule();
+            assert_eq!(scheduled.decode_requests.len(), 1);
+            assert_eq!(
+                scheduled.decode_requests[0].num_tokens, expected,
+                "backend={backend:?}, loaded={loaded}, enabled={enabled}"
+            );
+        }
+    }
+
+    #[test]
+    fn sustained_cuda_quantum_yields_to_peers_and_respects_output_and_hard_deadline() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 4,
+            max_tokens_per_step: 32,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::FCFS,
+            enable_chunked_prefill: false,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let id = "sustained-peer-fairness".to_string();
+        let mut request = build_request(TaskType::Chat, &id, Priority::Normal);
+        request.params.max_tokens = 5;
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler.get_sequence_id(&id).unwrap();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cuda, None, ExecutionMode::Sequence);
+        profile.prefill = PrefillMode::Full;
+        profile.incremental_decode = true;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.preferred_decode_tokens = 4;
+        profile.sustained_decode_quantum = true;
+        profile.resolved_from_loaded_model = true;
+        assert!(scheduler.update_execution_profile(&SessionKey::new(id.clone(), epoch), &profile));
+        assert_eq!(scheduler.schedule().prefill_requests.len(), 1);
+        scheduler.update_after_step(&id, request.num_prompt_tokens(), 1, 1.0);
+        scheduler.requests.get_mut(&id).unwrap().deadline_at =
+            Instant::now() - Duration::from_secs(2);
+        assert_eq!(scheduler.schedule().decode_requests[0].num_tokens, 4);
+
+        let peer = build_request(TaskType::Chat, "sustained-peer", Priority::Normal);
+        assert!(scheduler.add_request(&peer));
+        let peer_epoch = scheduler.get_sequence_id(&peer.id).unwrap();
+        let mut peer_profile = profile.clone();
+        peer_profile.prefill = PrefillMode::Incremental;
+        assert!(scheduler.update_execution_profile(
+            &SessionKey::new(peer.id.clone(), peer_epoch),
+            &peer_profile,
+        ));
+        let scheduled = scheduler.schedule();
+        assert_eq!(
+            scheduled.prefill_requests.len(),
+            1,
+            "waiting peer must receive service"
+        );
+        assert_eq!(scheduled.decode_requests[0].num_tokens, 1);
+        scheduler.update_after_step(&peer.id, peer.num_prompt_tokens(), 1, 1.0);
+        let scheduled = scheduler.schedule();
+        assert!(
+            scheduled
+                .decode_requests
+                .iter()
+                .all(|row| row.num_tokens == 1),
+            "multiple active sequences must retain single-token fairness"
+        );
+        scheduler.finish_request(&peer.id);
+        scheduler.update_after_step(&id, 3, 3, 1.0);
+        assert_eq!(
+            scheduler.schedule().decode_requests[0].num_tokens,
+            1,
+            "the last output token caps a larger preferred quantum"
+        );
+        scheduler.requests.get_mut(&id).unwrap().hard_deadline =
+            Some(Instant::now() - Duration::from_millis(1));
+        let scheduled = scheduler.schedule();
+        assert!(scheduled.decode_requests.is_empty());
+        assert_eq!(scheduled.expired_requests.len(), 1);
     }
 
     #[test]

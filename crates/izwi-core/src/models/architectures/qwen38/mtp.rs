@@ -1,5 +1,6 @@
 //! Recurrent multi-token-prediction head for native Qwen3.8 checkpoints.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use candle_core::{Device, Module, Tensor};
@@ -9,9 +10,9 @@ use super::native::{
     QWEN38_MTP_TENSOR_COUNT,
 };
 use super::text::{
-    load_native_projection, load_native_zero_centered_norm, native_projection_representation,
-    Qwen38FullAttention, Qwen38Mlp, Qwen38Projection, Qwen38ProjectionRepresentation,
-    Qwen38RmsNorm, Qwen38TextModel,
+    load_native_projection, load_native_zero_centered_norm, native_fp8_selected,
+    native_projection_representation, Qwen38FullAttention, Qwen38Mlp, Qwen38Projection,
+    Qwen38ProjectionRepresentation, Qwen38RmsNorm, Qwen38TextModel,
 };
 use crate::backends::kv::KvWriteCompletionCollector;
 use crate::error::{Error, Result};
@@ -46,6 +47,113 @@ impl TryFrom<usize> for Qwen38MtpDepth {
 
     fn try_from(value: usize) -> Result<Self> {
         Self::new(value)
+    }
+}
+
+/// Per-request latency controller. It compares elapsed time per committed
+/// token, including draft, verification and prefix commit. Exploration is
+/// bounded to four arms (scalar and depths 1..3), one probe every eight rounds.
+/// Scheduler-limited tails do not train the controller.
+#[derive(Clone, Debug)]
+pub(crate) struct AdaptiveMtp {
+    enabled: bool,
+    speculation_disabled: bool,
+    fixed_depth: usize,
+    selected: usize,
+    samples: [u32; 4],
+    cost_per_token: [f64; 4],
+    rounds: u64,
+    probe: usize,
+}
+
+impl AdaptiveMtp {
+    pub(crate) fn new(enabled: bool, starting_depth: usize) -> Self {
+        let depth = starting_depth.clamp(1, 3);
+        Self {
+            enabled,
+            speculation_disabled: false,
+            fixed_depth: depth,
+            selected: depth,
+            samples: [0; 4],
+            cost_per_token: [0.0; 4],
+            rounds: 0,
+            probe: 0,
+        }
+    }
+
+    /// A numerical draft failure disables speculation for the entire request,
+    /// including fixed-depth mode and any delayed timing observations.
+    pub(crate) fn disable_after_nonfinite_draft(&mut self) {
+        self.speculation_disabled = true;
+    }
+
+    pub(crate) fn speculation_disabled(&self) -> bool {
+        self.speculation_disabled
+    }
+
+    /// Roll back timing policy without forgetting a numerical failure observed
+    /// either before the checkpoint or in the cancelled quantum.
+    pub(crate) fn restore_from_checkpoint(&mut self, checkpoint: Self) {
+        let speculation_disabled = self.speculation_disabled || checkpoint.speculation_disabled;
+        *self = checkpoint;
+        self.speculation_disabled = speculation_disabled;
+    }
+
+    pub(crate) fn can_train(&self, budget: usize) -> bool {
+        !self.speculation_disabled() && self.enabled && budget >= 4
+    }
+
+    pub(crate) fn depth(&self, budget: usize) -> usize {
+        if self.speculation_disabled {
+            return 0;
+        }
+        let ceiling = budget.saturating_sub(1).min(3);
+        if !self.enabled {
+            return self.fixed_depth.min(ceiling);
+        }
+        let arm = if self.rounds > 0 && self.rounds.is_multiple_of(8) {
+            self.probe
+        } else {
+            self.selected
+        };
+        arm.min(ceiling)
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        depth: usize,
+        committed: usize,
+        elapsed: std::time::Duration,
+        budget: usize,
+    ) {
+        if self.speculation_disabled
+            || !self.enabled
+            || depth > 3
+            || committed == 0
+            || budget < 4
+            || elapsed.is_zero()
+        {
+            return;
+        }
+        let cost = elapsed.as_secs_f64() / committed as f64;
+        self.cost_per_token[depth] = if self.samples[depth] == 0 {
+            cost
+        } else {
+            self.cost_per_token[depth] * 0.75 + cost * 0.25
+        };
+        self.samples[depth] = self.samples[depth].saturating_add(1);
+        if self.rounds > 0 && self.rounds.is_multiple_of(8) {
+            self.probe = (self.probe + 1) % 4;
+        }
+        self.rounds = self.rounds.saturating_add(1);
+        // Require a 5% advantage before switching to reduce timer noise churn.
+        for candidate in 0..4 {
+            if self.samples[candidate] > 0
+                && self.cost_per_token[candidate] < self.cost_per_token[self.selected] * 0.95
+            {
+                self.selected = candidate;
+            }
+        }
     }
 }
 
@@ -201,6 +309,25 @@ impl Qwen38MtpHead {
         device: &Device,
         target: ProjectionMaterialization,
     ) -> Result<Self> {
+        let performance = crate::performance::PerformanceConfig::default().resolve_env()?;
+        Self::load_native_with_performance(
+            tensors,
+            native,
+            inventory,
+            device,
+            target,
+            &performance.cuda,
+        )
+    }
+
+    pub(crate) fn load_native_with_performance(
+        tensors: &IndexedSafetensors,
+        native: &Qwen38NativeConfig,
+        inventory: &Qwen38MtpInventory,
+        device: &Device,
+        target: ProjectionMaterialization,
+        performance: &crate::performance::CudaPerformanceConfig,
+    ) -> Result<Self> {
         if native.mtp.num_hidden_layers != 1 || native.mtp.use_dedicated_embeddings {
             return Err(Error::ModelLoadError(format!(
                 "Unsupported Qwen3.8 MTP topology: layers={}, dedicated_embeddings={}",
@@ -225,7 +352,21 @@ impl Qwen38MtpHead {
             .map_err(|_| Error::ModelLoadError("Qwen3.8 MTP layer id exceeds u32".into()))?;
         Ok(Self {
             device: device.clone(),
-            projection_representation: native_projection_representation(device, target),
+            projection_representation: if native_fp8_selected(
+                device,
+                target,
+                [hidden, cfg.feed_forward_length],
+                performance,
+            ) {
+                match target {
+                    ProjectionMaterialization::F16 => {
+                        Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackF16
+                    }
+                    _ => Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackBf16,
+                }
+            } else {
+                native_projection_representation(device, target)
+            },
             hidden_size: hidden,
             model_layer,
             pre_fc_norm_embedding: load_native_zero_centered_norm(
@@ -251,6 +392,7 @@ impl Qwen38MtpHead {
                 block,
                 target,
                 device,
+                performance,
             )?,
             input_layernorm: load_native_zero_centered_norm(
                 tensors,
@@ -261,7 +403,13 @@ impl Qwen38MtpHead {
                 device,
             )?,
             attention: Qwen38FullAttention::load_native(
-                tensors, device, prefix, cfg, block, target,
+                tensors,
+                device,
+                prefix,
+                cfg,
+                block,
+                target,
+                performance,
             )?,
             post_attention_layernorm: load_native_zero_centered_norm(
                 tensors,
@@ -271,7 +419,7 @@ impl Qwen38MtpHead {
                 target,
                 device,
             )?,
-            mlp: Qwen38Mlp::load_native(tensors, device, prefix, cfg, block, target)?,
+            mlp: Qwen38Mlp::load_native(tensors, device, prefix, cfg, block, target, performance)?,
             norm: load_native_zero_centered_norm(
                 tensors,
                 "mtp.norm.weight",
@@ -281,6 +429,10 @@ impl Qwen38MtpHead {
                 device,
             )?,
         })
+    }
+
+    pub(crate) fn graph_diagnostics(&self) -> serde_json::Value {
+        self.mlp.graph_diagnostics()
     }
 
     pub(crate) fn projection_representation(&self) -> Qwen38ProjectionRepresentation {
@@ -478,6 +630,8 @@ impl Qwen38MtpHead {
     /// prompt prefill. The selector projects/samples that row. Each non-final
     /// sampled token is embedded and appended with the preceding MTP hidden to
     /// produce the next prediction row.
+    /// A selector break discards the whole partial proposal; errors remain
+    /// fatal. The caller restores the physical cache checkpoint in either case.
     pub(crate) fn draft_recurrently<S, E>(
         &self,
         first_lm_head_hidden: &Tensor,
@@ -486,9 +640,9 @@ impl Qwen38MtpHead {
         cache: &mut PhysicalPagedKvCache,
         mut select: S,
         mut embed: E,
-    ) -> Result<Qwen38MtpDraftSequence>
+    ) -> Result<ControlFlow<Error, Qwen38MtpDraftSequence>>
     where
-        S: FnMut(usize, &Tensor) -> Result<u32>,
+        S: FnMut(usize, &Tensor) -> Result<ControlFlow<Error, u32>>,
         E: FnMut(u32) -> Result<Tensor>,
     {
         if first_lm_head_hidden.dims3()? != (1, 1, self.hidden_size) {
@@ -509,7 +663,10 @@ impl Qwen38MtpHead {
         let mut lm_head_hidden = Vec::with_capacity(depth.get());
         let mut current = first_lm_head_hidden.clone();
         for step in 0..depth.get() {
-            let token = select(step, &current)?;
+            let token = match select(step, &current)? {
+                ControlFlow::Continue(token) => token,
+                ControlFlow::Break(reason) => return Ok(ControlFlow::Break(reason)),
+            };
             token_ids.push(token);
             lm_head_hidden.push(current.clone());
             if step < continuation_count {
@@ -517,10 +674,10 @@ impl Qwen38MtpHead {
                     self.forward_step(embed(token)?, current, continuation_positions[step], cache)?;
             }
         }
-        Ok(Qwen38MtpDraftSequence {
+        Ok(ControlFlow::Continue(Qwen38MtpDraftSequence {
             token_ids,
             lm_head_hidden,
-        })
+        }))
     }
 
     /// Convenience recurrence using the target model's shared embedding and
@@ -533,9 +690,9 @@ impl Qwen38MtpHead {
         continuation_positions: &[[usize; 3]],
         cache: &mut PhysicalPagedKvCache,
         mut select_logits: S,
-    ) -> Result<Qwen38MtpDraftSequence>
+    ) -> Result<ControlFlow<Error, Qwen38MtpDraftSequence>>
     where
-        S: FnMut(usize, &Tensor) -> Result<u32>,
+        S: FnMut(usize, &Tensor) -> Result<ControlFlow<Error, u32>>,
     {
         self.draft_recurrently(
             first_lm_head_hidden,
@@ -552,7 +709,7 @@ impl Qwen38MtpHead {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -575,10 +732,10 @@ mod tests {
         BlockFp8Config, Qwen38LayerType, Qwen38MtpConfig,
     };
 
-    struct TestDir(PathBuf);
+    pub(crate) struct TestDir(PathBuf);
 
     impl TestDir {
-        fn new(label: &str) -> Self {
+        pub(crate) fn new(label: &str) -> Self {
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -591,7 +748,7 @@ mod tests {
             Self(path)
         }
 
-        fn path(&self) -> &Path {
+        pub(crate) fn path(&self) -> &Path {
             &self.0
         }
     }
@@ -609,7 +766,7 @@ mod tests {
         data: Vec<u8>,
     }
 
-    fn tiny_config() -> Qwen38NativeConfig {
+    pub(crate) fn tiny_config() -> Qwen38NativeConfig {
         Qwen38NativeConfig {
             text: Qwen38TextConfig {
                 architecture: "qwen3_5".into(),
@@ -690,7 +847,7 @@ mod tests {
         ));
     }
 
-    fn write_tiny_checkpoint(dir: &Path, config: &Qwen38NativeConfig) {
+    pub(crate) fn write_tiny_checkpoint(dir: &Path, config: &Qwen38NativeConfig) {
         let hidden = config.text.embedding_length;
         let ff = config.text.feed_forward_length;
         let q_width = config.text.attention_head_count * config.text.attention_key_length * 2;
@@ -764,7 +921,7 @@ mod tests {
         .unwrap();
     }
 
-    fn tiny_cache(config: &Qwen38NativeConfig) -> PhysicalPagedKvCache {
+    pub(crate) fn tiny_cache(config: &Qwen38NativeConfig) -> PhysicalPagedKvCache {
         let arena_id = KvArenaId {
             model_instance: ModelInstanceId::new(81),
             backend: BackendKind::Cpu,
@@ -804,7 +961,10 @@ mod tests {
         PhysicalPagedKvCache::new(arena, vec![binding], blocks, 0).unwrap()
     }
 
-    fn tiny_shared_caches(config: &Qwen38NativeConfig, rows: usize) -> Vec<PhysicalPagedKvCache> {
+    pub(crate) fn tiny_shared_caches(
+        config: &Qwen38NativeConfig,
+        rows: usize,
+    ) -> Vec<PhysicalPagedKvCache> {
         let arena_id = KvArenaId {
             model_instance: ModelInstanceId::new(82),
             backend: BackendKind::Cpu,
@@ -948,7 +1108,7 @@ mod tests {
                 &mut cache,
                 |step, hidden| {
                     assert_eq!(hidden.dims3().unwrap(), (1, 1, 4));
-                    Ok(3 + step as u32)
+                    Ok(ControlFlow::Continue(3 + step as u32))
                 },
                 |token| {
                     embed_calls += 1;
@@ -957,11 +1117,80 @@ mod tests {
                     Tensor::from_vec(values, (1, 1, 4), &Device::Cpu).map_err(Error::from)
                 },
             )
-            .unwrap();
+            .unwrap()
+            .continue_value()
+            .expect("complete draft sequence");
         assert_eq!(drafts.token_ids, [3, 4, 5]);
         assert_eq!(drafts.lm_head_hidden.len(), 3);
         assert_eq!(embed_calls, 2);
         assert_eq!(cache.context_len(), 4);
+    }
+
+    #[test]
+    fn partial_draft_break_discards_sequence_and_backend_error_remains_fatal() {
+        let dir = TestDir::new("partial-draft-abort");
+        let config = tiny_config();
+        write_tiny_checkpoint(dir.path(), &config);
+        let tensors = IndexedSafetensors::open(dir.path()).unwrap();
+        let inventory = tensors.validate_mtp_tensor_manifest(&config).unwrap();
+        let head = Qwen38MtpHead::load_native(
+            &tensors,
+            &config,
+            &inventory,
+            &Device::Cpu,
+            ProjectionMaterialization::F32,
+        )
+        .unwrap();
+        let mut cache = tiny_cache(&config);
+        let input = Tensor::ones((1, 1, 4), DType::F32, &Device::Cpu).unwrap();
+        let seed = head
+            .forward_step(input.clone(), input.clone(), [0; 3], &mut cache)
+            .unwrap();
+
+        for backend_error in [false, true] {
+            let checkpoint = cache.logical_checkpoint();
+            let mut selected_steps = Vec::new();
+            let mut embedded_tokens = Vec::new();
+            let outcome = head.draft_recurrently(
+                &seed,
+                Qwen38MtpDepth::new(3).unwrap(),
+                &[[1; 3], [2; 3]],
+                &mut cache,
+                |step, _| {
+                    selected_steps.push(step);
+                    if step == 0 {
+                        return Ok(ControlFlow::Continue(3));
+                    }
+                    assert_eq!(step, 1, "selection must stop at the failed draft");
+                    if backend_error {
+                        Err(Error::InferenceError("backend failure".into()))
+                    } else {
+                        Ok(ControlFlow::Break(Error::InferenceError(
+                            "non-finite draft".into(),
+                        )))
+                    }
+                },
+                |token| {
+                    embedded_tokens.push(token);
+                    Ok(input.clone())
+                },
+            );
+            match (backend_error, outcome) {
+                (false, Ok(ControlFlow::Break(Error::InferenceError(reason)))) => {
+                    assert_eq!(reason, "non-finite draft");
+                }
+                (true, Err(Error::InferenceError(reason))) => {
+                    assert_eq!(reason, "backend failure");
+                }
+                _ => panic!("partial proposal must not escape as a completed sequence"),
+            }
+            assert_eq!(selected_steps, [0, 1]);
+            assert_eq!(embedded_tokens, [3]);
+            assert_eq!(cache.context_len(), 2, "only step zero appended a KV row");
+            // The caller owns rollback of the successful provisional step.
+            cache.restore_logical_checkpoint(checkpoint).unwrap();
+            assert_eq!(cache.context_len(), 1);
+        }
     }
 
     #[test]
@@ -1024,5 +1253,130 @@ mod tests {
         assert_eq!(Qwen38MtpDepth::new(1).unwrap().get(), 1);
         assert_eq!(Qwen38MtpDepth::new(3).unwrap().get(), 3);
         assert!(Qwen38MtpDepth::new(4).is_err());
+    }
+}
+
+#[cfg(test)]
+mod adaptive_tests {
+    use super::AdaptiveMtp;
+    use std::time::Duration;
+    #[test]
+    fn starts_shallow_explores_bounded_depths_and_selects_elapsed_cost() {
+        let mut policy = AdaptiveMtp::new(true, 1);
+        assert_eq!(policy.depth(4), 1);
+        let mut seen = [false; 4];
+        for _ in 0..160 {
+            let depth = policy.depth(4);
+            seen[depth] = true;
+            let committed = depth + 1;
+            // Depth two is fastest despite depth three accepting more tokens.
+            let cost = [20, 15, 8, 12][depth];
+            policy.observe(
+                depth,
+                committed,
+                Duration::from_millis(cost * committed as u64),
+                4,
+            );
+        }
+        assert_eq!(seen, [true; 4]);
+        assert_eq!(policy.selected, 2);
+        assert_eq!(policy.depth(1), 0);
+        assert!(policy.depth(2) <= 1);
+    }
+    #[test]
+    fn poor_speculation_selects_scalar_and_opt_out_is_fixed() {
+        let mut policy = AdaptiveMtp::new(true, 1);
+        for _ in 0..80 {
+            let depth = policy.depth(4);
+            policy.observe(
+                depth,
+                1,
+                Duration::from_millis(if depth == 0 { 5 } else { 30 }),
+                4,
+            );
+        }
+        assert_eq!(policy.selected, 0);
+        let mut fixed = AdaptiveMtp::new(false, 3);
+        fixed.observe(0, 1, Duration::from_nanos(1), 4);
+        assert_eq!(fixed.depth(4), 3);
+        assert_eq!(fixed.depth(2), 1);
+    }
+    #[test]
+    fn cancellation_clone_and_scheduler_limited_tails_do_not_change_policy() {
+        let base = AdaptiveMtp::new(true, 1);
+        let mut cancelled = base.clone();
+        cancelled.observe(1, 2, Duration::from_millis(1), 4);
+        assert_eq!(base.rounds, 0);
+        let mut limited = base.clone();
+        limited.observe(0, 1, Duration::from_millis(1), 1);
+        assert_eq!(limited.rounds, 0);
+    }
+
+    #[test]
+    fn numerical_disable_blocks_fixed_depth_probes_and_delayed_observations() {
+        for adaptive in [false, true] {
+            let mut policy = AdaptiveMtp::new(adaptive, 3);
+            assert!(!policy.speculation_disabled());
+            assert_eq!(policy.depth(4), 3);
+            for _ in 0..8 {
+                policy.observe(3, 4, Duration::from_millis(4), 4);
+            }
+            let before = policy.clone();
+            policy.disable_after_nonfinite_draft();
+            policy.disable_after_nonfinite_draft();
+            assert!(policy.speculation_disabled());
+            // Events queued before the failure must not train or re-enable
+            // the controller, even across multiple exploration intervals.
+            for _ in 0..32 {
+                for depth in 0..=3 {
+                    policy.observe(depth, depth + 1, Duration::from_nanos(1), 4);
+                }
+            }
+            for budget in [0, 1, 2, 4, usize::MAX] {
+                assert_eq!(policy.depth(budget), 0);
+                assert!(!policy.can_train(budget));
+            }
+            assert_eq!(policy.samples, before.samples);
+            assert_eq!(policy.cost_per_token, before.cost_per_token);
+            assert_eq!(policy.rounds, before.rounds);
+            assert_eq!(policy.probe, before.probe);
+            assert_eq!(policy.selected, before.selected);
+        }
+    }
+
+    #[test]
+    fn checkpoint_restore_keeps_either_numerical_latch_and_restores_timing_policy() {
+        for current_disabled in [false, true] {
+            for checkpoint_disabled in [false, true] {
+                let mut checkpoint = AdaptiveMtp::new(true, 1);
+                checkpoint.observe(1, 2, Duration::from_millis(2), 4);
+                if checkpoint_disabled {
+                    checkpoint.disable_after_nonfinite_draft();
+                }
+                let mut current = AdaptiveMtp::new(false, 3);
+                if current_disabled {
+                    current.disable_after_nonfinite_draft();
+                }
+                current.restore_from_checkpoint(checkpoint.clone());
+                let disabled = current_disabled || checkpoint_disabled;
+                assert_eq!(current.speculation_disabled(), disabled);
+                assert_eq!(current.enabled, checkpoint.enabled);
+                assert_eq!(current.fixed_depth, checkpoint.fixed_depth);
+                assert_eq!(current.selected, checkpoint.selected);
+                assert_eq!(current.samples, checkpoint.samples);
+                assert_eq!(current.cost_per_token, checkpoint.cost_per_token);
+                assert_eq!(current.rounds, checkpoint.rounds);
+                assert_eq!(current.probe, checkpoint.probe);
+                if disabled {
+                    current.observe(3, 4, Duration::from_nanos(1), 4);
+                    assert_eq!(current.rounds, checkpoint.rounds);
+                    assert_eq!(current.depth(4), 0);
+                    assert!(!current.can_train(4));
+                } else {
+                    assert_eq!(current.depth(4), checkpoint.depth(4));
+                    assert!(current.can_train(4));
+                }
+            }
+        }
     }
 }

@@ -1,14 +1,20 @@
 //! Native Qwen3.8 chat model loader and text generation.
 
+mod device_sampling;
+#[cfg(test)]
+pub(crate) mod recovery_tests;
+mod timing;
+
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
+use std::ops::ControlFlow;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use candle_core::{DType, IndexOp, Tensor, D};
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::backends::device::cuda_compute_capability_supports_bf16;
 use crate::backends::state::{
@@ -34,10 +40,11 @@ use crate::models::shared::speculative_sampling::{
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 use super::cache::qwen38_composite_cache_contract_with_mtp;
-use super::mtp::{Qwen38MtpDepth, Qwen38MtpHead, Qwen38MtpPairBatch};
+use super::mtp::{AdaptiveMtp, Qwen38MtpDepth, Qwen38MtpHead, Qwen38MtpPairBatch};
 use super::native::{ProjectionMaterialization, Qwen38NativeCheckpoint, QWEN38_27B_FP8_REVISION};
 use super::telemetry::{
-    record_cuda_kv_provider, record_mtp_policy, record_mtp_round, record_mtp_scalar_target_token,
+    record_cuda_kv_provider, record_mtp_nonfinite_draft_fallback, record_mtp_policy,
+    record_mtp_round, record_mtp_round_timing, record_mtp_scalar_target_token,
     record_sampling_bounded_cuda, record_sampling_device_argmax, record_sampling_host,
     snapshot as qwen38_optimization_telemetry_snapshot,
 };
@@ -119,7 +126,7 @@ enum Qwen38KvStorageProvider {
     MetalF16,
     CudaF16Fallback,
     CudaF16CapabilityFallback,
-    CudaBf16Candidate,
+    CudaBf16,
 }
 
 impl Qwen38KvStorageProvider {
@@ -132,12 +139,12 @@ impl Qwen38KvStorageProvider {
             BackendKind::Cpu => Self::CpuF32,
             BackendKind::Metal => Self::MetalF16,
             BackendKind::Cuda
-                if qwen38_candidate_enabled(cuda_bf16_override)
+                if qwen38_bf16_kv_enabled(cuda_bf16_override)
                     && qwen38_cuda_supports_bf16(cuda_compute_capability) =>
             {
-                Self::CudaBf16Candidate
+                Self::CudaBf16
             }
-            BackendKind::Cuda if qwen38_candidate_enabled(cuda_bf16_override) => {
+            BackendKind::Cuda if qwen38_bf16_kv_enabled(cuda_bf16_override) => {
                 Self::CudaF16CapabilityFallback
             }
             BackendKind::Cuda => Self::CudaF16Fallback,
@@ -148,7 +155,7 @@ impl Qwen38KvStorageProvider {
         match self {
             Self::CpuF32 => DType::F32,
             Self::MetalF16 | Self::CudaF16Fallback | Self::CudaF16CapabilityFallback => DType::F16,
-            Self::CudaBf16Candidate => DType::BF16,
+            Self::CudaBf16 => DType::BF16,
         }
     }
 
@@ -158,18 +165,18 @@ impl Qwen38KvStorageProvider {
             Self::MetalF16 => "metal_f16",
             Self::CudaF16Fallback => "cuda_f16_fallback",
             Self::CudaF16CapabilityFallback => "cuda_f16_capability_fallback",
-            Self::CudaBf16Candidate => "cuda_bf16_candidate",
+            Self::CudaBf16 => "cuda_bf16",
         }
     }
 
     const fn fallback_reason(self) -> Option<&'static str> {
         match self {
-            Self::CudaF16Fallback => Some(
-                "CUDA BF16 KV is an unvalidated candidate; set IZWI_QWEN38_CUDA_BF16_KV=1 to test it",
-            ),
-            Self::CudaF16CapabilityFallback => Some(
-                "CUDA BF16 KV requires an observed compute capability 8.0 or newer; using F16",
-            ),
+            Self::CudaF16Fallback => {
+                Some("CUDA BF16 KV disabled by IZWI_QWEN38_CUDA_BF16_KV; using F16")
+            }
+            Self::CudaF16CapabilityFallback => {
+                Some("CUDA BF16 KV requires an observed compute capability 8.0 or newer; using F16")
+            }
             _ => None,
         }
     }
@@ -179,10 +186,13 @@ fn qwen38_cuda_supports_bf16(compute_capability: Option<(u32, u32)>) -> bool {
     compute_capability.is_some_and(cuda_compute_capability_supports_bf16)
 }
 
-fn qwen38_candidate_enabled(raw: Option<&str>) -> bool {
+fn qwen38_bf16_kv_enabled(raw: Option<&str>) -> bool {
+    // BF16 activations must retain their exponent range in persistent KV.
+    // Narrowing finite values above 65504 to F16 inserts infinities into the
+    // cache; later attention (including masked P*V) can then produce NaNs.
     matches!(
         raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("1" | "true" | "yes" | "on")
+        None | Some("1" | "true" | "yes" | "on")
     )
 }
 
@@ -276,7 +286,42 @@ fn initial_penalty_history(
     history
 }
 
+/// Durable CPU-only continuation record. It deliberately owns no tensors, cache
+/// views, device events, or physical sequence identities.
+#[derive(Clone)]
+pub(crate) struct Qwen38ReplayCheckpoint {
+    prepared: Qwen38PreparedPrompt,
+    generated_ids: Vec<u32>,
+    appended_tokens: usize,
+    prefill_progress: usize,
+    pending_token: Option<u32>,
+    bootstrap_token: Option<u32>,
+    history_ids: Vec<u32>,
+    decoder: IncrementalDecoder,
+    tokens_generated: usize,
+    track_history: bool,
+    assembled: String,
+    max_new_tokens: usize,
+    next_text_position: usize,
+    config: ChatGenerationConfig,
+    rng: SimpleRng,
+    draft_rng: SimpleRng,
+    adaptive_mtp: AdaptiveMtp,
+}
+
+impl Qwen38ReplayCheckpoint {
+    pub(crate) fn replay_tokens(&self) -> usize {
+        self.appended_tokens
+    }
+}
+
 pub struct ChatDecodeState {
+    replay: Option<std::sync::Arc<Qwen38ReplayCheckpoint>>,
+    prepared: Qwen38PreparedPrompt,
+    /// Append-only CPU journal; bounded by max_new_tokens. Step rollback
+    /// stores only its length, avoiding quadratic history copies. Suspension
+    /// temporarily clones at most 4 * max_new_tokens bytes (plus prompt IDs).
+    generated_ids: Vec<u32>,
     text_state: Qwen38TextRuntimeState,
     physical_kv: PhysicalPagedKvCache,
     mtp_physical_kv: Option<PhysicalPagedKvCache>,
@@ -301,9 +346,56 @@ pub struct ChatDecodeState {
     config: ChatGenerationConfig,
     rng: SimpleRng,
     draft_rng: SimpleRng,
+    adaptive_mtp: AdaptiveMtp,
+    mtp_timings: Vec<timing::PendingRound>,
 }
 
 impl ChatDecodeState {
+    pub(crate) fn replay_tokens(&self) -> Option<usize> {
+        self.replay.as_ref().map(|saved| saved.appended_tokens)
+    }
+    /// Caller must fence the completed step before releasing its physical state.
+    pub(crate) fn replay_checkpoint(&self) -> Result<Qwen38ReplayCheckpoint> {
+        if let Some(saved) = &self.replay {
+            return Ok((**saved).clone());
+        }
+        if self.finished {
+            return Err(Error::InvalidInput(
+                "cannot suspend a finished Qwen3.8 sequence".into(),
+            ));
+        }
+        let appended_tokens = self.physical_kv.context_len();
+        let known = self
+            .prepared
+            .prompt_ids
+            .len()
+            .saturating_add(self.generated_ids.len());
+        if appended_tokens > known || appended_tokens < self.prefill_progress {
+            return Err(Error::InferenceError(
+                "Qwen3.8 replay journal does not cover cache cursor".into(),
+            ));
+        }
+        Ok(Qwen38ReplayCheckpoint {
+            prepared: self.prepared.clone(),
+            generated_ids: self.generated_ids.clone(),
+            appended_tokens,
+            prefill_progress: self.prefill_progress,
+            pending_token: self.pending_token,
+            bootstrap_token: self.bootstrap_token,
+            history_ids: self.history_ids.clone(),
+            decoder: self.decoder.clone(),
+            tokens_generated: self.tokens_generated,
+            track_history: self.track_history,
+            assembled: self.assembled.clone(),
+            max_new_tokens: self.max_new_tokens,
+            next_text_position: self.next_text_position,
+            config: self.config.clone(),
+            rng: self.rng.clone(),
+            draft_rng: self.draft_rng.clone(),
+            adaptive_mtp: self.adaptive_mtp.clone(),
+        })
+    }
+
     pub(crate) fn prefill_progress(&self) -> usize {
         self.prefill_progress
     }
@@ -393,6 +485,7 @@ impl ChatDecodeState {
             }
         }
         Ok(Qwen38SharedStepCheckpoint {
+            replay: self.replay.clone(),
             text_state: self.text_state.clone(),
             mtp_anchor_hidden: self.mtp_anchor_hidden.clone(),
             unconsumed_output: self.unconsumed_output.clone(),
@@ -400,12 +493,15 @@ impl ChatDecodeState {
             bootstrap_token: self.bootstrap_token,
             next_text_position: self.next_text_position,
             history_ids: self.history_ids.clone(),
+            generated_ids_len: self.generated_ids.len(),
             tokens_generated: self.tokens_generated,
             decoder: self.decoder.clone(),
             assembled: self.assembled.clone(),
             finished: self.finished,
             rng: self.rng.clone(),
             draft_rng: self.draft_rng.clone(),
+            adaptive_mtp: self.adaptive_mtp.clone(),
+            mtp_timings: self.mtp_timings.clone(),
             physical_kv: std::mem::replace(&mut self.physical_kv, cache),
             mtp_physical_kv: match mtp_cache {
                 Some(new_mtp) => self.mtp_physical_kv.replace(new_mtp),
@@ -416,6 +512,7 @@ impl ChatDecodeState {
 
     pub(crate) fn rollback_shared_step_quantum(&mut self, checkpoint: Qwen38SharedStepCheckpoint) {
         let Qwen38SharedStepCheckpoint {
+            replay,
             text_state,
             physical_kv,
             mtp_physical_kv,
@@ -425,13 +522,17 @@ impl ChatDecodeState {
             bootstrap_token,
             next_text_position,
             history_ids,
+            generated_ids_len,
             tokens_generated,
             decoder,
             assembled,
             finished,
             rng,
             draft_rng,
+            adaptive_mtp,
+            mtp_timings,
         } = checkpoint;
+        self.replay = replay;
         self.text_state = text_state;
         self.physical_kv = physical_kv;
         self.mtp_physical_kv = mtp_physical_kv;
@@ -441,12 +542,15 @@ impl ChatDecodeState {
         self.bootstrap_token = bootstrap_token;
         self.next_text_position = next_text_position;
         self.history_ids = history_ids;
+        self.generated_ids.truncate(generated_ids_len);
         self.tokens_generated = tokens_generated;
         self.decoder = decoder;
         self.assembled = assembled;
         self.finished = finished;
         self.rng = rng;
         self.draft_rng = draft_rng;
+        self.adaptive_mtp.restore_from_checkpoint(adaptive_mtp);
+        self.mtp_timings = mtp_timings;
     }
 
     pub(crate) fn bind_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
@@ -498,6 +602,7 @@ pub struct ChatDecodeStep {
 /// writes under the new views are abandoned when the previous views are
 /// restored on rollback.
 pub(crate) struct Qwen38SharedStepCheckpoint {
+    replay: Option<std::sync::Arc<Qwen38ReplayCheckpoint>>,
     text_state: Qwen38TextRuntimeState,
     physical_kv: PhysicalPagedKvCache,
     mtp_physical_kv: Option<PhysicalPagedKvCache>,
@@ -507,12 +612,15 @@ pub(crate) struct Qwen38SharedStepCheckpoint {
     bootstrap_token: Option<u32>,
     next_text_position: usize,
     history_ids: Vec<u32>,
+    generated_ids_len: usize,
     tokens_generated: usize,
     decoder: IncrementalDecoder,
     assembled: String,
     finished: bool,
     rng: SimpleRng,
     draft_rng: SimpleRng,
+    adaptive_mtp: AdaptiveMtp,
+    mtp_timings: Vec<timing::PendingRound>,
 }
 
 #[derive(Debug, Clone)]
@@ -683,6 +791,9 @@ impl Qwen38Tokenizer {
 
 pub struct Qwen38ChatModel {
     device_kind: BackendKind,
+    performance: crate::performance::PerformanceConfig,
+    load_timing: serde_json::Value,
+    prefill_chunk_size: usize,
     cuda_compute_capability: Option<(u32, u32)>,
     kv_storage_provider: Qwen38KvStorageProvider,
     variant: ModelVariant,
@@ -697,6 +808,10 @@ fn qwen38_fp8_execution_mode(
     projection_representation: Qwen38ProjectionRepresentation,
 ) -> &'static str {
     match projection_representation {
+        Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackF16
+        | Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackBf16 => {
+            "native_block_fp8_explicit_with_compact_q8_fallback"
+        }
         Qwen38ProjectionRepresentation::PackedQ8WithDenseF16
         | Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16 => "q8_0_compressed_fallback",
         Qwen38ProjectionRepresentation::ExpandedF32
@@ -709,6 +824,7 @@ fn qwen38_fp8_fallback_reason(
     projection_representation: Qwen38ProjectionRepresentation,
 ) -> &'static str {
     match projection_representation {
+        Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackF16 | Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackBf16 => "explicit native FP8 provider; unsupported shapes remain compact Q8; Auto retains tuned Q8 until device performance is established",
         Qwen38ProjectionRepresentation::PackedQ8WithDenseF16
         | Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16 => {
             "CUDA applies weight_scale_inv during scale-aware FP8 dequantization and then requantizes projections to Q8_0 for Candle execution; native FP8 execution is not runtime-certified"
@@ -753,30 +869,55 @@ impl InferenceStateContractProvider for Qwen38ChatModel {
 
 impl Qwen38ChatModel {
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
+        let performance = crate::performance::PerformanceConfig::default().resolve_env()?;
+        Self::load_with_performance(model_dir, variant, device, &performance)
+    }
+
+    pub fn load_with_performance(
+        model_dir: &Path,
+        variant: ModelVariant,
+        device: DeviceProfile,
+        performance: &crate::performance::PerformanceConfig,
+    ) -> Result<Self> {
+        performance.validate()?;
         if variant != ModelVariant::Qwen3827BFp8 {
             return Err(Error::ModelLoadError(format!(
                 "Unsupported Qwen3.8 chat variant: {variant}"
             )));
         }
-        let checkpoint = Qwen38NativeCheckpoint::open(model_dir)?;
-        let mtp_policy = Qwen38MtpPolicy::from_process_environment()?;
+        let checkpoint =
+            Qwen38NativeCheckpoint::open_with_options(model_dir, &performance.loading)?;
+        let mtp_enabled = if device.device.is_cuda() {
+            performance.cuda.enabled() && performance.cuda.mtp.enabled()
+        } else {
+            performance.cuda.mtp.enabled()
+        };
+        let mtp_policy = if mtp_enabled {
+            Qwen38MtpPolicy::Enabled {
+                draft_tokens: performance.cuda.mtp_draft_tokens,
+            }
+        } else {
+            Qwen38MtpPolicy::Disabled
+        };
         let tokenizer = Qwen38Tokenizer::load_hf(model_dir)?;
         let text_config = checkpoint.config.text.clone();
         let projection_materialization = qwen38_projection_materialization(&device)?;
-        let text_model = Qwen38TextModel::load_native(
+        let text_model = Qwen38TextModel::load_native_with_performance(
             &checkpoint.tensors,
             &checkpoint.config,
             &device.device,
             projection_materialization,
+            &performance.cuda,
         )?;
         let mtp_head = match mtp_policy {
             Qwen38MtpPolicy::Disabled => None,
-            Qwen38MtpPolicy::Enabled { .. } => Some(Qwen38MtpHead::load_native(
+            Qwen38MtpPolicy::Enabled { .. } => Some(Qwen38MtpHead::load_native_with_performance(
                 &checkpoint.tensors,
                 &checkpoint.config,
                 &checkpoint.mtp,
                 &device.device,
                 projection_materialization,
+                &performance.cuda,
             )?),
         };
         record_mtp_policy(mtp_policy.enabled());
@@ -785,9 +926,7 @@ impl Qwen38ChatModel {
         let cuda_compute_capability = device.capabilities.cuda_compute_capability;
         let kv_storage_provider = qwen38_kv_storage_provider(device_kind, cuda_compute_capability);
         if device_kind == BackendKind::Cuda {
-            record_cuda_kv_provider(
-                kv_storage_provider == Qwen38KvStorageProvider::CudaBf16Candidate,
-            );
+            record_cuda_kv_provider(kv_storage_provider == Qwen38KvStorageProvider::CudaBf16);
         }
         info!(
             variant = %variant,
@@ -803,6 +942,9 @@ impl Qwen38ChatModel {
         );
         Ok(Self {
             device_kind,
+            performance: performance.clone(),
+            load_timing: checkpoint.tensors.loading_diagnostics(),
+            prefill_chunk_size: qwen38_prefill_chunk_size(),
             cuda_compute_capability,
             kv_storage_provider,
             variant,
@@ -812,6 +954,53 @@ impl Qwen38ChatModel {
             mtp_policy,
             mtp_head,
         })
+    }
+
+    pub(crate) fn sustained_cuda_mtp_quantum(&self) -> bool {
+        self.device_kind == BackendKind::Cuda
+            && self.performance.cuda.enabled()
+            && self.performance.cuda.mtp_quantum.enabled()
+            && self.mtp_policy.enabled()
+    }
+
+    pub(crate) fn graph_cache_capacity_bytes(&self) -> u64 {
+        if self.device_kind == BackendKind::Cuda
+            && self.performance.cuda.enabled()
+            && self.performance.cuda.decode_graphs.enabled()
+        {
+            (8 * 1024 * 1024) * (1 + u64::from(self.mtp_head.is_some()))
+        } else {
+            0
+        }
+    }
+
+    fn device_sampling_enabled(&self) -> bool {
+        self.device_kind == BackendKind::Cuda
+            && self.performance.cuda.enabled()
+            && self.performance.cuda.device_sampling.enabled()
+    }
+
+    fn sample_next_token(
+        &self,
+        logits: &Tensor,
+        vocab_size: usize,
+        config: &ChatGenerationConfig,
+        history: &[u32],
+        rng: &mut SimpleRng,
+    ) -> Result<u32> {
+        if self.device_sampling_enabled() {
+            let token = device_sampling::sample(logits, vocab_size, config, history, rng)?;
+            record_sampling_bounded_cuda(true);
+            return Ok(token);
+        }
+        // Explicit CUDA opt-out uses the compatibility host sampler. CPU and
+        // Metal retain their established sampling routes.
+        let logits = if logits.device().is_cuda() {
+            logits.to_device(&candle_core::Device::Cpu)?
+        } else {
+            logits.clone()
+        };
+        sample_next_token(&logits, vocab_size, config, history, rng)
     }
 
     pub fn variant(&self) -> ModelVariant {
@@ -894,6 +1083,76 @@ impl Qwen38ChatModel {
             (false, true) => "scalar_only",
             (false, false) => "not_observed",
         };
+        let optimization_evidence = serde_json::json!({
+            "scope": "qwen38_process_lifetime",
+            "cuda_runtime_validated": false,
+            "performance": self.performance,
+            "load_timing": self.load_timing,
+            "cuda_compute_capability": self.cuda_compute_capability.map(|(major, minor)| format!("{major}.{minor}")),
+            "counters": optimization_counters,
+            "managed_kv_counters_source": "runtime_metrics.kv_cache.models[].arenas[].operations",
+            "managed_kv_counter_coverage": [
+                "allocation",
+                "workspace",
+                "workspace_budget_and_high_water",
+                "full_request_page_claims",
+                "host_synchronization",
+                "attention_provider",
+                "cuda_graph"
+            ],
+            "cuda_kv_storage": {
+                "candidate_switch": CUDA_BF16_KV_ENV,
+                "default_on_supported_cuda": true,
+                "selected_provider": self.kv_storage_provider.as_str(),
+                "storage_dtype": format!("{:?}", self.kv_storage_provider.dtype()).to_ascii_lowercase(),
+                "fallback_reason": self.kv_storage_provider.fallback_reason(),
+                "runtime_validated": false,
+                "quantized": false,
+                "physical_format": "dense",
+                "quantized_candidate_status": "unavailable_scale_contract_incomplete",
+            },
+            "prefill": {
+                "chunk_tokens": self.prefill_chunk_size,
+                "target_hidden_retention": "final_row_only",
+                "mtp_bootstrap": if self.mtp_policy.enabled() {
+                    "streamed_shifted_chunks"
+                } else {
+                    "disabled"
+                },
+                "transient_memory_bound": "chunk_shaped",
+                "chunk_override": "IZWI_QWEN38_PREFILL_CHUNK_SIZE",
+                "maximum_chunk_tokens": MAX_PREFILL_CHUNK_SIZE,
+            },
+            "mtp": {
+                "enabled": self.mtp_policy.enabled(),
+                "draft_tokens": self.mtp_policy.draft_tokens(),
+                "adaptive": self.device_kind == BackendKind::Cuda && self.performance.cuda.enabled() && self.performance.cuda.mtp_adaptive,
+                "depth_semantics": "starting_depth_when_adaptive_otherwise_fixed",
+                "adaptive_objective": "completed_cuda_event_seconds_per_committed_token",
+                "adaptive_timing": "delayed_nonblocking_event_query_includes_final_mtp_commit",
+                "adaptive_depth_bounds": [0, 3],
+                "prefix_commit": "compact_recurrence_reconstruction_without_target_weight_replay",
+                "default_enabled": DEFAULT_MTP_ENABLED,
+                "default_draft_tokens": DEFAULT_MTP_DRAFT_TOKENS,
+                "enabled_switch": MTP_ENABLED_ENV,
+                "depth_switch": MTP_DRAFT_TOKENS_ENV,
+                "implementation_status": "implemented_unvalidated",
+                "runtime_validated": false,
+                "performance_certified": false,
+                "scheduler_policy": "speculate_only_without_queue_pressure_or_concurrent_decode",
+                "nonfinite_draft_policy": "discard_round_and_use_target_only_sampling_for_request",
+                "execution_evidence": {
+                    "observed_execution": observed_execution,
+                    "draft_acceptance_rate": draft_acceptance_rate,
+                    "bonus_rate": bonus_rate,
+                    "target_replay_to_verified_ratio": replay_amplification,
+                    "speculative_round_counter": "mtp_rounds_total",
+                    "scalar_target_counter": "mtp_scalar_target_tokens_total",
+                    "accepted_draft_counter": "mtp_accepted_draft_tokens_total",
+                    "replayed_target_counter": "mtp_target_replay_tokens_total",
+                },
+            },
+        });
         serde_json::json!({
             "checkpoint_revision": QWEN38_27B_FP8_REVISION,
             "checkpoint_format": "safetensors_block_fp8",
@@ -901,66 +1160,23 @@ impl Qwen38ChatModel {
             "runtime_compute_dtype": representation.runtime_compute_dtype,
             "fp8_execution_mode": representation.fp8_execution_mode,
             "fallback_reason": representation.fallback_reason,
-            "optimization_evidence": {
-                "scope": "qwen38_process_lifetime",
-                "cuda_runtime_validated": false,
-                "cuda_compute_capability": self.cuda_compute_capability.map(|(major, minor)| format!("{major}.{minor}")),
-                "counters": optimization_counters,
-                "managed_kv_counters_source": "runtime_metrics.kv_cache.models[].arenas[].operations",
-                "managed_kv_counter_coverage": [
-                    "allocation",
-                    "workspace",
-                    "workspace_budget_and_high_water",
-                    "full_request_page_claims",
-                    "host_synchronization",
-                    "attention_provider",
-                    "cuda_graph"
-                ],
-                "cuda_kv_storage": {
-                    "candidate_switch": CUDA_BF16_KV_ENV,
-                    "selected_provider": self.kv_storage_provider.as_str(),
-                    "storage_dtype": format!("{:?}", self.kv_storage_provider.dtype()).to_ascii_lowercase(),
-                    "fallback_reason": self.kv_storage_provider.fallback_reason(),
-                    "runtime_validated": false,
-                    "quantized": false,
-                    "physical_format": "dense",
-                    "quantized_candidate_status": "unavailable_scale_contract_incomplete",
-                },
-                "prefill": {
-                    "chunk_tokens": qwen38_prefill_chunk_size(),
-                    "target_hidden_retention": "final_row_only",
-                    "mtp_bootstrap": if self.mtp_policy.enabled() {
-                        "streamed_shifted_chunks"
-                    } else {
-                        "disabled"
-                    },
-                    "transient_memory_bound": "chunk_shaped",
-                    "chunk_override": "IZWI_QWEN38_PREFILL_CHUNK_SIZE",
-                    "maximum_chunk_tokens": MAX_PREFILL_CHUNK_SIZE,
-                },
-                "mtp": {
-                    "enabled": self.mtp_policy.enabled(),
-                    "draft_tokens": self.mtp_policy.draft_tokens(),
-                    "default_enabled": DEFAULT_MTP_ENABLED,
-                    "default_draft_tokens": DEFAULT_MTP_DRAFT_TOKENS,
-                    "enabled_switch": MTP_ENABLED_ENV,
-                    "depth_switch": MTP_DRAFT_TOKENS_ENV,
-                    "implementation_status": "implemented_unvalidated",
-                    "runtime_validated": false,
-                    "performance_certified": false,
-                    "scheduler_policy": "speculate_only_without_queue_pressure_or_concurrent_decode",
-                    "execution_evidence": {
-                        "observed_execution": observed_execution,
-                        "draft_acceptance_rate": draft_acceptance_rate,
-                        "bonus_rate": bonus_rate,
-                        "target_replay_to_verified_ratio": replay_amplification,
-                        "speculative_round_counter": "mtp_rounds_total",
-                        "scalar_target_counter": "mtp_scalar_target_tokens_total",
-                        "accepted_draft_counter": "mtp_accepted_draft_tokens_total",
-                        "replayed_target_counter": "mtp_target_replay_tokens_total",
-                    },
-                },
+            "performance": self.performance,
+            "load_timing": self.load_timing,
+            "decode_graphs": {
+                "requested": self.performance.cuda.enabled() && self.performance.cuda.decode_graphs.enabled(),
+                "regions": ["residual_add_then_rms_norm", "explicit_native_fp8_gate_up_silu_down"],
+                "max_verification_rows": 4,
+                "target_layer_limit": 8,
+                "target_counters": self.text_model.graph_diagnostics(),
+                "mtp_counters": self.mtp_head.as_ref().map(Qwen38MtpHead::graph_diagnostics),
+                "maximum_cache_bytes": self.graph_cache_capacity_bytes(),
+                "ownership": "model_owned_serialized_graphs_with_stable_inputs_outputs_and_weights",
+                "fallback": "shape_or_capture_failure_negative_cached_eager_region",
+                "q8_mlp_capture": "excluded_unretainable_candle_global_scratch",
+                "full_model_capture": false,
+                "runtime_validated": false,
             },
+            "optimization_evidence": optimization_evidence,
             "vision_enabled": false,
         })
     }
@@ -997,57 +1213,26 @@ impl Qwen38ChatModel {
 
     /// Conservative per-row workspace estimate for hybrid batch collation.
     pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
-        let cfg = &self.text_config;
-        let hidden = u64::try_from(cfg.embedding_length).ok();
-        let ff = u64::try_from(cfg.feed_forward_length).ok();
-        let q = cfg
-            .attention_head_count
-            .checked_mul(cfg.attention_key_length)
-            .and_then(|width| width.checked_mul(2))
-            .and_then(|width| u64::try_from(width).ok());
-        let kv = cfg
-            .attention_head_count_kv
-            .checked_mul(cfg.attention_key_length)
-            .and_then(|width| u64::try_from(width).ok());
-        let conv = cfg
-            .ssm_group_count
-            .checked_mul(cfg.ssm_state_size)
-            .and_then(|width| width.checked_mul(2))
-            .and_then(|width| width.checked_add(cfg.ssm_inner_size))
-            .and_then(|width| u64::try_from(width).ok());
-        let elements = hidden
-            .and_then(|hidden| hidden.checked_mul(8))
-            .and_then(|base| base.checked_add(ff?.checked_mul(2)?))
-            .and_then(|base| base.checked_add(q?))
-            .and_then(|base| base.checked_add(kv?.checked_mul(2)?))
-            .and_then(|base| base.checked_add(conv?))
-            .and_then(|target| {
-                if self.mtp_head.is_some() {
-                    target.checked_add(
-                        hidden?
-                            .checked_mul(8)?
-                            .checked_add(ff?.checked_mul(2)?)?
-                            .checked_add(q?)?
-                            .checked_add(kv?.checked_mul(2)?)?,
-                    )
-                } else {
-                    Some(target)
-                }
-            })
-            .ok_or_else(|| {
-                Error::Overloaded("continuous decode workspace estimate overflow".to_string())
-            })?;
-        // The recurrent/attention collation tensors use F32 in portable and
-        // state-update paths even when projection activations use F16/BF16.
-        elements.checked_mul(4).ok_or_else(|| {
-            Error::Overloaded("continuous decode workspace byte estimate overflow".to_string())
-        })
+        continuous_decode_workspace_per_row_bytes(
+            &self.text_config,
+            self.tokenizer.vocab_size,
+            self.mtp_head
+                .as_ref()
+                .map(|_| self.preferred_decode_tokens()),
+        )
     }
 
     pub(crate) fn preferred_decode_tokens(&self) -> usize {
-        self.mtp_policy
-            .draft_tokens()
-            .map_or(1, |draft_tokens| draft_tokens.saturating_add(1))
+        self.mtp_policy.draft_tokens().map_or(1, |draft_tokens| {
+            if self.device_kind == BackendKind::Cuda
+                && self.performance.cuda.enabled()
+                && self.performance.cuda.mtp_adaptive
+            {
+                4
+            } else {
+                draft_tokens.saturating_add(1)
+            }
+        })
     }
 
     pub fn device_kind(&self) -> BackendKind {
@@ -1104,7 +1289,7 @@ impl Qwen38ChatModel {
             match (&self.mtp_head, mtp_cache.as_mut()) {
                 (Some(head), Some(mtp_cache)) => {
                     let history: &[u32] = if track_history { &history_ids } else { &[] };
-                    let anchor = sample_next_token(
+                    let anchor = self.sample_next_token(
                         &logits,
                         self.tokenizer.vocab_size,
                         config,
@@ -1133,6 +1318,9 @@ impl Qwen38ChatModel {
             };
         let draft_rng = rng.fork();
         Ok(ChatDecodeState {
+            replay: None,
+            prepared: prepared.clone(),
+            generated_ids: Vec::new(),
             text_state,
             physical_kv: cache,
             mtp_physical_kv: mtp_cache,
@@ -1153,7 +1341,163 @@ impl Qwen38ChatModel {
             config: config.clone(),
             rng,
             draft_rng,
+            mtp_timings: Vec::new(),
+            adaptive_mtp: AdaptiveMtp::new(
+                self.device_kind == BackendKind::Cuda
+                    && self.performance.cuda.enabled()
+                    && self.performance.cuda.mtp_adaptive,
+                self.performance.cuda.mtp_draft_tokens,
+            ),
         })
+    }
+
+    /// Build CPU continuation metadata with empty physical state. Replay spans
+    /// are scheduled independently and must complete before decode resumes.
+    pub(crate) fn begin_replay_state_physical(
+        &self,
+        saved: &Qwen38ReplayCheckpoint,
+        cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
+    ) -> Result<ChatDecodeState> {
+        if cache.context_len() != 0
+            || mtp_cache
+                .as_ref()
+                .is_some_and(|cache| cache.context_len() != 0)
+            || self.mtp_head.is_some() != mtp_cache.is_some()
+        {
+            return Err(Error::InvalidInput(
+                "Qwen3.8 replay requires fresh matching cache reservations".into(),
+            ));
+        }
+        Ok(ChatDecodeState {
+            replay: (saved.appended_tokens > 0).then(|| std::sync::Arc::new(saved.clone())),
+            prepared: saved.prepared.clone(),
+            generated_ids: saved.generated_ids.clone(),
+            text_state: self.text_model.new_state(),
+            physical_kv: cache,
+            mtp_physical_kv: mtp_cache,
+            mtp_anchor_hidden: None,
+            bootstrap_token: saved.bootstrap_token,
+            physical_tensor_sequence: None,
+            unconsumed_output: None,
+            pending_token: saved.pending_token,
+            history_ids: saved.history_ids.clone(),
+            decoder: saved.decoder.clone(),
+            tokens_generated: saved.tokens_generated,
+            track_history: saved.track_history,
+            assembled: saved.assembled.clone(),
+            max_new_tokens: saved.max_new_tokens,
+            finished: false,
+            next_text_position: saved.next_text_position,
+            prefill_progress: saved.prefill_progress,
+            config: saved.config.clone(),
+            rng: saved.rng.clone(),
+            draft_rng: saved.draft_rng.clone(),
+            adaptive_mtp: saved.adaptive_mtp.clone(),
+            mtp_timings: Vec::new(),
+        })
+    }
+
+    /// Rebuild one scheduler quantum without sampling or emitting output.
+    /// Target IDs stop at the append cursor; MTP additionally consumes the
+    /// known successor, including a sampled token that target has not appended.
+    pub(crate) fn continue_replay_physical(
+        &self,
+        state: &mut ChatDecodeState,
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        let saved = state
+            .replay
+            .as_ref()
+            .ok_or_else(|| Error::InvalidInput("Qwen3.8 state has no pending replay".into()))?;
+        if state.physical_kv.context_len() != span_start
+            || span_end <= span_start
+            || span_end > saved.appended_tokens
+        {
+            return Err(Error::InvalidInput(
+                "Qwen3.8 replay span does not continue its append cursor".into(),
+            ));
+        }
+        let prompt_len = saved.prepared.prompt_ids.len();
+        let known_len = prompt_len + saved.generated_ids.len();
+        let token_at = |index: usize| {
+            if index < prompt_len {
+                saved.prepared.prompt_ids.get(index).copied()
+            } else if index < known_len {
+                saved.generated_ids.get(index - prompt_len).copied()
+            } else if index == known_len && known_len == saved.appended_tokens {
+                saved.pending_token
+            } else {
+                None
+            }
+        };
+        let ids: Vec<_> = (span_start..=span_end).filter_map(token_at).collect();
+        let positions: Vec<_> = (span_start..span_end)
+            .map(|index| {
+                if index < prompt_len {
+                    saved.prepared.prompt_positions[index]
+                } else {
+                    [saved.prepared.next_text_position + index - prompt_len; 3]
+                }
+            })
+            .collect();
+        let prompt_complete = saved.prefill_progress == saved.prepared.prompt_ids.len();
+        for start in (span_start..span_end).step_by(self.prefill_chunk_size) {
+            let end = (start + self.prefill_chunk_size).min(span_end);
+            let output = self
+                .text_model
+                .prefill_token_ids_with_hidden_physical(
+                    &ids[start - span_start..end - span_start],
+                    &positions[start - span_start..end - span_start],
+                    &mut state.text_state,
+                    &mut state.physical_kv,
+                    end == saved.appended_tokens,
+                )?
+                .ok_or_else(|| {
+                    Error::InferenceError("Qwen3.8 replay produced no hidden state".into())
+                })?;
+            if let (Some(head), Some(mtp)) = (&self.mtp_head, state.mtp_physical_kv.as_mut()) {
+                let count = (end - span_start)
+                    .min(ids.len().saturating_sub(1))
+                    .saturating_sub(start - span_start);
+                if count > 0 {
+                    let pairs = Qwen38MtpPairBatch::new(
+                        self.text_model.embed_token_ids(
+                            &ids[start - span_start + 1..start - span_start + count + 1],
+                        )?,
+                        output.hidden_states.narrow(1, 0, count)?,
+                        positions[start - span_start..start - span_start + count].to_vec(),
+                    )?;
+                    let hidden = head.forward_pairs(&pairs, mtp)?;
+                    if end == saved.appended_tokens && prompt_complete {
+                        state.mtp_anchor_hidden = Some(hidden.narrow(1, count - 1, 1)?);
+                    }
+                }
+            }
+            if end == saved.appended_tokens && prompt_complete && saved.pending_token.is_none() {
+                state.unconsumed_output = output.logits;
+            }
+        }
+        let finished = span_end == saved.appended_tokens;
+        if finished {
+            state.replay = None;
+        }
+        Ok(finished)
+    }
+
+    /// Convenience restoration used by adapters without scheduler replay spans.
+    pub(crate) fn restore_decode_state_physical(
+        &self,
+        saved: &Qwen38ReplayCheckpoint,
+        cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
+    ) -> Result<ChatDecodeState> {
+        let mut state = self.begin_replay_state_physical(saved, cache, mtp_cache)?;
+        if saved.appended_tokens > 0 {
+            self.continue_replay_physical(&mut state, 0, saved.appended_tokens)?;
+        }
+        Ok(state)
     }
 
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
@@ -1194,6 +1538,9 @@ impl Qwen38ChatModel {
         let mut rng = SimpleRng::new(config.seed);
         let draft_rng = rng.fork();
         Ok(ChatDecodeState {
+            replay: None,
+            prepared: prepared.clone(),
+            generated_ids: Vec::new(),
             text_state: self.text_model.new_state(),
             physical_kv: cache,
             mtp_physical_kv: mtp_cache,
@@ -1214,6 +1561,13 @@ impl Qwen38ChatModel {
             config: config.clone(),
             rng,
             draft_rng,
+            mtp_timings: Vec::new(),
+            adaptive_mtp: AdaptiveMtp::new(
+                self.device_kind == BackendKind::Cuda
+                    && self.performance.cuda.enabled()
+                    && self.performance.cuda.mtp_adaptive,
+                self.performance.cuda.mtp_draft_tokens,
+            ),
         })
     }
 
@@ -1311,7 +1665,7 @@ impl Qwen38ChatModel {
                 } else {
                     &[]
                 };
-                let anchor = sample_next_token(
+                let anchor = self.sample_next_token(
                     &logits,
                     self.tokenizer.vocab_size,
                     &state.config,
@@ -1357,7 +1711,8 @@ impl Qwen38ChatModel {
             return Ok(Vec::new());
         }
         for state in states.iter() {
-            if state.finished
+            if state.replay.is_some()
+                || state.finished
                 || state.tokens_generated >= state.max_new_tokens
                 || state.bootstrap_token.is_some()
                 || state.unconsumed_output.is_some()
@@ -1398,20 +1753,30 @@ impl Qwen38ChatModel {
         drop(text_states);
         drop(caches);
 
-        let mut sampled = Vec::with_capacity(state_count);
-        for (row, state) in states.iter_mut().enumerate() {
-            let history: &[u32] = if state.track_history {
-                &state.history_ids
-            } else {
-                &[]
-            };
-            sampled.push(sample_next_token(
-                &target.logits.i((row, 0))?,
-                self.tokenizer.vocab_size,
-                &state.config,
-                history,
-                &mut state.rng,
-            )?);
+        let batch_greedy = self.device_sampling_enabled()
+            && states
+                .iter()
+                .all(|state| state.config.temperature <= 1e-5 && !state.track_history);
+        let mut sampled = if batch_greedy {
+            device_sampling::greedy(&target.logits.squeeze(1)?, self.tokenizer.vocab_size)?
+        } else {
+            Vec::with_capacity(state_count)
+        };
+        if !batch_greedy {
+            for (row, state) in states.iter_mut().enumerate() {
+                let history: &[u32] = if state.track_history {
+                    &state.history_ids
+                } else {
+                    &[]
+                };
+                sampled.push(self.sample_next_token(
+                    &target.logits.i((row, 0))?,
+                    self.tokenizer.vocab_size,
+                    &state.config,
+                    history,
+                    &mut state.rng,
+                )?);
+            }
         }
         let terminal_rows = states
             .iter()
@@ -1480,6 +1845,11 @@ impl Qwen38ChatModel {
         state: &mut ChatDecodeState,
         input_budget: usize,
     ) -> Result<ChatDecodeStep> {
+        if state.replay.is_some() {
+            return Err(Error::InvalidInput(
+                "Qwen3.8 decode cannot run before replay completes".into(),
+            ));
+        }
         if state.finished || state.tokens_generated >= state.max_new_tokens {
             state.finished = true;
             let delta = self.tokenizer.finish_decode(&mut state.decoder)?;
@@ -1519,8 +1889,12 @@ impl Qwen38ChatModel {
         } else {
             &[]
         };
-        let next = take_quantum_sample(
-            &mut state.unconsumed_output,
+        let output = state
+            .unconsumed_output
+            .take()
+            .ok_or_else(|| Error::InferenceError("missing Qwen3.8 output".into()))?;
+        let next = self.sample_next_token(
+            &output,
             self.tokenizer.vocab_size,
             &state.config,
             history,
@@ -1554,6 +1928,7 @@ impl Qwen38ChatModel {
     }
 
     fn publish_token(&self, state: &mut ChatDecodeState, token: u32) -> Result<String> {
+        state.generated_ids.push(token);
         if self.is_stop_token(token, &state.config) {
             state.finished = true;
             let delta = self.tokenizer.finish_decode(&mut state.decoder)?;
@@ -1574,6 +1949,26 @@ impl Qwen38ChatModel {
         Ok(delta)
     }
 
+    fn observe_completed_mtp_timings(&self, state: &mut ChatDecodeState) {
+        // Bounded event owners also participate in the quantum checkpoint. A
+        // cancelled quantum restores the old observations and policy together.
+        let mut index = 0;
+        while index < state.mtp_timings.len() {
+            if let Some(elapsed) = state.mtp_timings[index].try_elapsed() {
+                let completed = state.mtp_timings.remove(index);
+                state.adaptive_mtp.observe(
+                    completed.depth,
+                    completed.committed,
+                    elapsed,
+                    completed.budget,
+                );
+                super::telemetry::record_mtp_completed_timing(elapsed);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
     fn decode_mtp_quantum(
         &self,
         state: &mut ChatDecodeState,
@@ -1583,15 +1978,28 @@ impl Qwen38ChatModel {
             .mtp_head
             .as_ref()
             .ok_or_else(|| Error::InferenceError("Qwen3.8 MTP decode has no loaded head".into()))?;
-        let configured_depth = self.mtp_policy.draft_tokens().ok_or_else(|| {
+        let _configured_depth = self.mtp_policy.draft_tokens().ok_or_else(|| {
             Error::InferenceError("Qwen3.8 MTP decode has a disabled policy".into())
         })?;
         let mut delta = String::new();
         let mut committed = 0usize;
 
         while committed < input_budget && !state.finished {
-            let remaining = input_budget - committed;
-            if remaining == 1 {
+            let remaining = (input_budget - committed).min(
+                state
+                    .max_new_tokens
+                    .saturating_sub(state.tokens_generated)
+                    .max(1),
+            );
+            self.observe_completed_mtp_timings(state);
+            let round_start = Instant::now();
+            let timer = if state.adaptive_mtp.can_train(remaining) {
+                timing::RoundTimer::start(self.text_model.device())
+            } else {
+                None
+            };
+            let selected_depth = state.adaptive_mtp.depth(remaining);
+            if selected_depth == 0 {
                 record_mtp_scalar_target_token();
                 let pending = state.pending_token.ok_or_else(|| {
                     Error::InferenceError("Qwen3.8 MTP scalar tail has no pending token".into())
@@ -1611,7 +2019,7 @@ impl Qwen38ChatModel {
                 } else {
                     &[]
                 };
-                let next = sample_next_token(
+                let next = self.sample_next_token(
                     &logits,
                     self.tokenizer.vocab_size,
                     &state.config,
@@ -1635,10 +2043,18 @@ impl Qwen38ChatModel {
                 state.next_text_position += 1;
                 committed += 1;
                 delta.push_str(&self.publish_token(state, next)?);
+                record_mtp_round_timing(0, 1, round_start.elapsed(), 0, remaining);
+                self.observe_completed_mtp_timings(state);
+                if let Some(pending) = timer.and_then(|timer| timer.finish(0, 1, remaining)) {
+                    if state.mtp_timings.len() == 4 {
+                        state.mtp_timings.remove(0);
+                    }
+                    state.mtp_timings.push(pending);
+                }
                 continue;
             }
 
-            let depth = configured_depth.min(remaining - 1);
+            let depth = selected_depth;
             let depth = Qwen38MtpDepth::new(depth)?;
             let mtp = state
                 .mtp_physical_kv
@@ -1658,6 +2074,9 @@ impl Qwen38ChatModel {
                 Vec::new()
             };
             let mut draft_proposals = Vec::with_capacity(depth.get());
+            let device_sampling = self.device_sampling_enabled();
+            let mut device_proposals = Vec::with_capacity(depth.get());
+            let draft_rng_checkpoint = state.draft_rng.clone();
             let drafted = head.draft_recurrently_with_text(
                 &self.text_model,
                 anchor_hidden,
@@ -1666,11 +2085,70 @@ impl Qwen38ChatModel {
                 mtp,
                 |_, logits| {
                     let logits = logits.i((0, 0))?;
-                    if !stochastic_drafting {
-                        return argmax_clamped(&logits, self.tokenizer.vocab_size);
+                    if device_sampling {
+                        if !stochastic_drafting {
+                            let token = match device_sampling::sample_or_abort(
+                                &logits,
+                                self.tokenizer.vocab_size,
+                                &state.config,
+                                &draft_history,
+                                &mut state.draft_rng,
+                                "draft",
+                            )? {
+                                ControlFlow::Continue(token) => token,
+                                ControlFlow::Break(error) => return Ok(ControlFlow::Break(error)),
+                            };
+                            record_sampling_bounded_cuda(true);
+                            if state.track_history {
+                                draft_history.push(token);
+                            }
+                            return Ok(ControlFlow::Continue(token));
+                        }
+                        let (token, q) = match device_sampling::propose_or_abort(
+                            &logits.unsqueeze(0)?,
+                            self.tokenizer.vocab_size,
+                            &state.config,
+                            &mut draft_history,
+                            &mut state.draft_rng,
+                        )? {
+                            ControlFlow::Continue(proposal) => proposal,
+                            ControlFlow::Break(error) => return Ok(ControlFlow::Break(error)),
+                        };
+                        device_proposals.push(q);
+                        return Ok(ControlFlow::Continue(token));
                     }
                     let mut values = logits_to_vec(&logits)?;
+                    if self.tokenizer.vocab_size == 0 || values.len() < self.tokenizer.vocab_size {
+                        return Err(Error::InvalidInput(
+                            "invalid Qwen3.8 draft sampling vocabulary".into(),
+                        ));
+                    }
                     truncate_logits_to_vocab(&mut values, self.tokenizer.vocab_size);
+                    if !values.iter().any(|value| value.is_finite()) {
+                        return Ok(ControlFlow::Break(Error::InferenceError(
+                            "No finite Qwen3.8 draft logits".into(),
+                        )));
+                    }
+                    if !stochastic_drafting {
+                        // The compatibility sampler already needs host logits
+                        // for numerical classification; reuse this same row.
+                        let logits = Tensor::from_vec(
+                            values,
+                            self.tokenizer.vocab_size,
+                            &candle_core::Device::Cpu,
+                        )?;
+                        let token = sample_next_token(
+                            &logits,
+                            self.tokenizer.vocab_size,
+                            &state.config,
+                            &draft_history,
+                            &mut state.draft_rng,
+                        )?;
+                        if state.track_history {
+                            draft_history.push(token);
+                        }
+                        return Ok(ControlFlow::Continue(token));
+                    }
                     let proposal = propose_speculative_draft(
                         &values,
                         &state.config,
@@ -1679,11 +2157,28 @@ impl Qwen38ChatModel {
                     )?;
                     let token = proposal.token_id;
                     draft_proposals.push(proposal);
-                    Ok(token)
+                    Ok(ControlFlow::Continue(token))
                 },
             );
             mtp.restore_logical_checkpoint(mtp_checkpoint)?;
-            let drafted = drafted?;
+            let drafted = match drafted? {
+                ControlFlow::Continue(drafted) => drafted,
+                ControlFlow::Break(error) => {
+                    // No target forward, target RNG, canonical history or
+                    // output has changed. Discard even earlier valid proposals
+                    // from this round and never sample this MTP state again.
+                    state.draft_rng = draft_rng_checkpoint;
+                    state.adaptive_mtp.disable_after_nonfinite_draft();
+                    record_mtp_nonfinite_draft_fallback();
+                    warn!(
+                        position = state.next_text_position,
+                        draft_depth = depth.get(),
+                        error = %error,
+                        "Qwen3.8 MTP produced no finite draft logits; continuing this request with target-only sampling"
+                    );
+                    continue;
+                }
+            };
 
             let pending = state.pending_token.ok_or_else(|| {
                 Error::InferenceError("Qwen3.8 MTP verification has no pending token".into())
@@ -1694,18 +2189,12 @@ impl Qwen38ChatModel {
             let positions = (0..target_inputs.len())
                 .map(|offset| [state.next_text_position + offset; 3])
                 .collect::<Vec<_>>();
-            let target_checkpoint = state.physical_kv.logical_checkpoint();
-            let text_checkpoint = state.text_state.clone();
-            let target_output = self
-                .text_model
-                .prefill_token_ids_with_hidden_physical(
-                    &target_inputs,
-                    &positions,
-                    &mut state.text_state,
-                    &mut state.physical_kv,
-                    false,
-                )?
-                .ok_or_else(|| Error::InferenceError("empty MTP verification span".into()))?;
+            let target_output = self.text_model.verify_token_ids_physical(
+                &target_inputs,
+                &positions,
+                &mut state.text_state,
+                &mut state.physical_kv,
+            )?;
             let target_logits = self
                 .text_model
                 .project_target_hidden_span(&target_output.hidden_states)?;
@@ -1714,14 +2203,41 @@ impl Qwen38ChatModel {
             } else {
                 Vec::new()
             };
-            let verification = if !stochastic_drafting && !state.track_history {
-                let mut target_tokens = Vec::with_capacity(target_inputs.len());
-                for row in 0..target_inputs.len() {
-                    let token =
-                        argmax_clamped(&target_logits.i((0, row))?, self.tokenizer.vocab_size)?;
-                    record_sampling_device_argmax();
-                    target_tokens.push(token);
-                }
+            let verification = if stochastic_drafting && device_sampling {
+                device_sampling::verify(
+                    &drafted.token_ids,
+                    &device_proposals,
+                    &target_logits,
+                    self.tokenizer.vocab_size,
+                    &state.config,
+                    &mut verification_history,
+                    &mut state.rng,
+                )?
+            } else if !stochastic_drafting && device_sampling && state.track_history {
+                device_sampling::verify_greedy(
+                    &drafted.token_ids,
+                    &target_logits,
+                    self.tokenizer.vocab_size,
+                    &state.config,
+                    &mut verification_history,
+                )?
+            } else if !stochastic_drafting && !state.track_history {
+                let target_tokens = if device_sampling {
+                    device_sampling::greedy(&target_logits.squeeze(0)?, self.tokenizer.vocab_size)?
+                } else {
+                    (0..target_inputs.len())
+                        .map(|row| {
+                            let logits = target_logits.i((0, row))?;
+                            self.sample_next_token(
+                                &logits,
+                                self.tokenizer.vocab_size,
+                                &state.config,
+                                &[],
+                                &mut state.rng,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                };
                 verify_greedy_token_prefix(
                     &drafted.token_ids,
                     &target_tokens,
@@ -1754,41 +2270,19 @@ impl Qwen38ChatModel {
             };
 
             let remaining_outputs = state.max_new_tokens.saturating_sub(state.tokens_generated);
-            let mut kept = Vec::new();
-            let mut non_stop = 0usize;
-            for token in verification.emitted_tokens.iter().copied() {
-                kept.push(token);
-                if self.is_stop_token(token, &state.config) {
-                    break;
-                }
-                non_stop += 1;
-                if non_stop >= remaining_outputs {
-                    break;
-                }
-            }
+            let kept = canonical_emitted_prefix(
+                &verification.emitted_tokens,
+                remaining_outputs,
+                |token| self.is_stop_token(token, &state.config),
+            );
             let canonical_count = kept.len();
-            let replay =
-                canonical_count != target_inputs.len() || !verification.all_drafts_accepted();
-            let canonical_hidden = if replay {
-                state
-                    .physical_kv
-                    .restore_logical_checkpoint(target_checkpoint)?;
-                state.text_state = text_checkpoint;
-                self.text_model
-                    .prefill_token_ids_with_hidden_physical(
-                        &target_inputs[..canonical_count],
-                        &positions[..canonical_count],
-                        &mut state.text_state,
-                        &mut state.physical_kv,
-                        false,
-                    )?
-                    .ok_or_else(|| Error::InferenceError("empty MTP replay span".into()))?
-                    .hidden_states
-            } else {
-                target_output.hidden_states
-            };
+            let canonical_hidden = target_output.commit_prefix(
+                canonical_count,
+                &mut state.text_state,
+                &mut state.physical_kv,
+            )?;
             if state.track_history {
-                state.history_ids = verification_history;
+                state.history_ids.extend_from_slice(&kept);
             }
             let canonical_pairs = Qwen38MtpPairBatch::new(
                 self.text_model.embed_token_ids(&kept)?,
@@ -1804,10 +2298,30 @@ impl Qwen38ChatModel {
             record_mtp_round(
                 drafted.token_ids.len(),
                 verification.accepted_draft_tokens,
-                verification.emitted_bonus_token(),
+                verification.emitted_bonus_token() && canonical_count == target_inputs.len(),
                 target_inputs.len(),
-                if replay { canonical_count } else { 0 },
+                0,
             );
+            record_mtp_round_timing(
+                selected_depth,
+                canonical_count,
+                round_start.elapsed(),
+                if canonical_count < target_inputs.len() {
+                    canonical_count
+                } else {
+                    0
+                },
+                remaining,
+            );
+            self.observe_completed_mtp_timings(state);
+            if let Some(pending) =
+                timer.and_then(|timer| timer.finish(selected_depth, canonical_count, remaining))
+            {
+                if state.mtp_timings.len() == 4 {
+                    state.mtp_timings.remove(0);
+                }
+                state.mtp_timings.push(pending);
+            }
             for token in kept {
                 delta.push_str(&self.publish_token(state, token)?);
                 if state.finished {
@@ -1843,7 +2357,7 @@ impl Qwen38ChatModel {
         let mut final_hidden = None;
         let end = prepared.prompt_ids.len();
         let mut chunk_start = 0;
-        let chunk_size = qwen38_prefill_chunk_size();
+        let chunk_size = self.prefill_chunk_size;
         while chunk_start < end {
             let chunk_end = (chunk_start + chunk_size).min(end);
             let compute_logits = chunk_end == end;
@@ -1918,6 +2432,106 @@ impl Qwen38ChatModel {
     }
 }
 
+/// Pure per-row geometry bound, excluding model-owned graph cache capacity.
+/// `Some(rows)` includes MTP transient and conservative verification storage.
+fn continuous_decode_workspace_per_row_bytes(
+    cfg: &Qwen38TextConfig,
+    vocab: usize,
+    mtp_verification_rows: Option<usize>,
+) -> Result<u64> {
+    let hidden = u64::try_from(cfg.embedding_length).ok();
+    let ff = u64::try_from(cfg.feed_forward_length).ok();
+    let q = cfg
+        .attention_head_count
+        .checked_mul(cfg.attention_key_length)
+        .and_then(|width| width.checked_mul(2))
+        .and_then(|width| u64::try_from(width).ok());
+    let kv = cfg
+        .attention_head_count_kv
+        .checked_mul(cfg.attention_key_length)
+        .and_then(|width| u64::try_from(width).ok());
+    let conv = cfg
+        .ssm_group_count
+        .checked_mul(cfg.ssm_state_size)
+        .and_then(|width| width.checked_mul(2))
+        .and_then(|width| width.checked_add(cfg.ssm_inner_size))
+        .and_then(|width| u64::try_from(width).ok());
+    let elements = hidden
+        .and_then(|hidden| hidden.checked_mul(8))
+        .and_then(|base| base.checked_add(ff?.checked_mul(2)?))
+        .and_then(|base| base.checked_add(q?))
+        .and_then(|base| base.checked_add(kv?.checked_mul(2)?))
+        .and_then(|base| base.checked_add(conv?))
+        .and_then(|target| {
+            if mtp_verification_rows.is_some() {
+                target.checked_add(
+                    hidden?
+                        .checked_mul(8)?
+                        .checked_add(ff?.checked_mul(2)?)?
+                        .checked_add(q?)?
+                        .checked_add(kv?.checked_mul(2)?)?,
+                )
+            } else {
+                Some(target)
+            }
+        })
+        .ok_or_else(|| {
+            Error::Overloaded("continuous decode workspace estimate overflow".to_string())
+        })?;
+    // The recurrent/attention collation tensors use F32 in portable and
+    // state-update paths even when projection activations use F16/BF16.
+    let transient = elements.checked_mul(4).ok_or_else(|| {
+        Error::Overloaded("continuous decode workspace byte estimate overflow".to_string())
+    })?;
+    let retained = match mtp_verification_rows {
+        Some(rows) => verification_workspace_bytes(cfg, vocab, rows)?,
+        None => 0,
+    };
+    // CUDA graph caches are model-owned resident/deferred reservations in
+    // runtime/lifecycle/qwen38_memory.rs, shared across every request row.
+    // Charging them here would reserve the same cache again for each row.
+    transient
+        .checked_add(retained)
+        .ok_or_else(|| Error::Overloaded("Qwen3.8 verification workspace overflow".into()))
+}
+
+/// Conservative bound for all simultaneously retained verification state,
+/// compact intermediates, recovery copies, probability rows and scratch.
+/// Count every layer as linear so unusual layer schedules cannot underprice it.
+fn verification_workspace_bytes(cfg: &Qwen38TextConfig, vocab: usize, rows: usize) -> Result<u64> {
+    let checked = || -> Option<u64> {
+        let rows = u64::try_from(rows.min(4)).ok()?;
+        let layers = u64::try_from(cfg.block_count).ok()?;
+        let inner = u64::try_from(cfg.ssm_inner_size).ok()?;
+        let key = u64::try_from(cfg.ssm_state_size).ok()?;
+        let heads = u64::try_from(cfg.ssm_group_count).ok()?;
+        let value_heads = u64::try_from(cfg.ssm_time_step_rank).ok()?;
+        let recurrent = key.checked_mul(inner)?;
+        let conv = key.checked_mul(heads)?.checked_mul(2)?.checked_add(inner)?;
+        let history = conv.checked_mul(cfg.ssm_conv_kernel.saturating_sub(1) as u64)?;
+        let compact = conv
+            .checked_mul(2)?
+            .checked_add(value_heads.checked_mul(2)?)?
+            .checked_mul(rows)?;
+        // Initial checkpoint and reconstructed prefix may coexist with the
+        // final verified state already counted in the session's base claim.
+        let retained = recurrent
+            .checked_mul(2)?
+            .checked_add(history)?
+            .checked_add(compact)?
+            .checked_mul(layers)?;
+        let recurrence_scratch = recurrent.checked_mul(6)?;
+        let logits = (vocab as u64).checked_mul(rows)?.checked_mul(6)?;
+        retained
+            .checked_add(recurrence_scratch)?
+            .checked_add(logits)?
+            .checked_add((cfg.embedding_length as u64).checked_mul(rows)?)?
+            .checked_mul(4)
+    };
+    checked()
+        .ok_or_else(|| Error::Overloaded("Qwen3.8 verification storage estimate overflow".into()))
+}
+
 fn build_text_positions(token_count: usize) -> Vec<[usize; 3]> {
     (0..token_count).map(|idx| [idx; 3]).collect()
 }
@@ -1926,6 +2540,24 @@ fn known_mtp_rows(chunk_start: usize, chunk_end: usize, prompt_len: usize) -> us
     chunk_end
         .min(prompt_len.saturating_sub(1))
         .saturating_sub(chunk_start)
+}
+
+fn canonical_emitted_prefix(
+    tokens: &[u32],
+    remaining_outputs: usize,
+    is_stop: impl Fn(u32) -> bool,
+) -> Vec<u32> {
+    let mut kept = Vec::with_capacity(tokens.len().min(remaining_outputs));
+    if remaining_outputs == 0 {
+        return kept;
+    }
+    for &token in tokens {
+        kept.push(token);
+        if is_stop(token) || kept.len() >= remaining_outputs {
+            break;
+        }
+    }
+    kept
 }
 
 fn sample_finishes_row(
@@ -2497,7 +3129,8 @@ impl SimpleRng {
     }
 
     fn next_f32(&mut self) -> f32 {
-        (self.next_u32() as f64 / (u32::MAX as f64 + 1.0)) as f32
+        ((self.next_u32() as f64 / (u32::MAX as f64 + 1.0)) as f32)
+            .min(f32::from_bits(1.0f32.to_bits() - 1))
     }
 }
 
@@ -2506,6 +3139,134 @@ mod tests {
     use crate::models::shared::chat::ChatRequestConfig;
 
     use super::*;
+
+    // Dimensions enforced by native::validate_hf_config for the shipped 27B
+    // checkpoint. No tokenizer, weights, device, or model load is needed.
+    fn shipped_workspace_config() -> Qwen38TextConfig {
+        Qwen38TextConfig {
+            architecture: "qwen3_5".into(),
+            block_count: 64,
+            context_length: 262_144,
+            embedding_length: 5_120,
+            feed_forward_length: 17_408,
+            attention_head_count: 24,
+            attention_head_count_kv: 4,
+            attention_key_length: 256,
+            attention_value_length: 256,
+            rope_dimension_sections: vec![11, 11, 10],
+            rope_dimension_count: 64,
+            rope_freq_base: 10_000_000.0,
+            attention_layer_norm_rms_epsilon: 1e-6,
+            ssm_conv_kernel: 4,
+            ssm_state_size: 128,
+            ssm_group_count: 16,
+            ssm_time_step_rank: 48,
+            ssm_inner_size: 6_144,
+            full_attention_interval: 4,
+        }
+    }
+
+    #[test]
+    fn shipped_decode_workspace_prices_adaptive_fixed_and_disabled_mtp() {
+        let cfg = shipped_workspace_config();
+        // Adaptive CUDA reserves four target positions even when its initial
+        // configured draft depth is one; fixed depth one needs two positions.
+        for (rows, verification, total) in
+            [(4, 474_382_336, 475_144_192), (2, 451_887_104, 452_648_960)]
+        {
+            assert_eq!(
+                verification_workspace_bytes(&cfg, 248_320, rows).unwrap(),
+                verification,
+            );
+            assert_eq!(
+                continuous_decode_workspace_per_row_bytes(&cfg, 248_320, Some(rows)).unwrap(),
+                total,
+            );
+            // Only target/MTP transient geometry is added to verification;
+            // the two model-owned 8 MiB graph caches must not reappear here.
+            assert_eq!(total - verification, 761_856);
+        }
+        assert_eq!(
+            continuous_decode_workspace_per_row_bytes(&cfg, 248_320, None).unwrap(),
+            401_408,
+        );
+        // Disabled MTP must not evaluate unused verification geometry.
+        assert_eq!(
+            continuous_decode_workspace_per_row_bytes(&cfg, usize::MAX, None).unwrap(),
+            401_408,
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn decode_workspace_rejects_geometry_and_verification_overflow() {
+        let cfg = shipped_workspace_config();
+        let mut malformed = Vec::new();
+        let mut hidden = cfg.clone();
+        hidden.embedding_length = usize::MAX;
+        malformed.push(hidden);
+        let mut attention = cfg.clone();
+        attention.attention_head_count = usize::MAX;
+        malformed.push(attention);
+        let mut convolution = cfg.clone();
+        convolution.ssm_group_count = usize::MAX;
+        malformed.push(convolution);
+        let mut layers = cfg.clone();
+        layers.block_count = usize::MAX;
+        malformed.push(layers);
+        for cfg in malformed {
+            assert!(matches!(
+                continuous_decode_workspace_per_row_bytes(&cfg, 248_320, Some(4)),
+                Err(Error::Overloaded(_)),
+            ));
+        }
+        assert!(matches!(
+            continuous_decode_workspace_per_row_bytes(&cfg, usize::MAX, Some(4)),
+            Err(Error::Overloaded(_)),
+        ));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn decode_workspace_rejects_f32_byte_conversion_overflow() {
+        let mut cfg = shipped_workspace_config();
+        // The element sum fits u64; converting that sum to F32 bytes does not.
+        cfg.embedding_length = usize::MAX / 32;
+        let error = continuous_decode_workspace_per_row_bytes(&cfg, 248_320, None)
+            .expect_err("F32 byte count must not wrap");
+        assert!(matches!(
+            error,
+            Error::Overloaded(message)
+                if message == "continuous decode workspace byte estimate overflow",
+        ));
+    }
+
+    #[test]
+    fn canonical_prefix_stops_at_each_eos_and_output_budget() {
+        let tokens = [10, 11, 12, 13];
+        for budget in 0..=4 {
+            assert_eq!(
+                canonical_emitted_prefix(&tokens, budget, |_| false),
+                tokens[..budget]
+            );
+            for eos in tokens {
+                let count = tokens.iter().position(|token| *token == eos).unwrap() + 1;
+                assert_eq!(
+                    canonical_emitted_prefix(&tokens, budget, |token| token == eos),
+                    tokens[..budget.min(count)]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unit_float_upper_edge_remains_strictly_below_one() {
+        let largest = f32::from_bits(1.0f32.to_bits() - 1);
+        for value in [0, 1, u32::MAX - 128, u32::MAX - 1, u32::MAX] {
+            let converted = ((value as f64 / (u32::MAX as f64 + 1.0)) as f32).min(largest);
+            assert!((0.0..1.0).contains(&converted));
+        }
+    }
 
     #[test]
     fn streamed_mtp_prefill_covers_every_shifted_prompt_row_once() {
@@ -2627,25 +3388,18 @@ mod tests {
     }
 
     #[test]
-    fn cuda_bf16_kv_candidate_is_explicit_and_fail_closed() {
-        for disabled in [
-            None,
-            Some(""),
-            Some("0"),
-            Some("false"),
-            Some("no"),
-            Some("off"),
-        ] {
+    fn cuda_bf16_kv_defaults_on_with_an_explicit_opt_out() {
+        for disabled in [Some(""), Some("0"), Some("false"), Some("no"), Some("off")] {
             let provider =
                 Qwen38KvStorageProvider::select(BackendKind::Cuda, Some((8, 0)), disabled);
             assert_eq!(provider, Qwen38KvStorageProvider::CudaF16Fallback);
             assert_eq!(provider.dtype(), DType::F16);
             assert!(provider.fallback_reason().is_some());
         }
-        for enabled in [Some("1"), Some("true"), Some(" YES "), Some("on")] {
+        for enabled in [None, Some("1"), Some("true"), Some(" YES "), Some("on")] {
             let provider =
                 Qwen38KvStorageProvider::select(BackendKind::Cuda, Some((8, 0)), enabled);
-            assert_eq!(provider, Qwen38KvStorageProvider::CudaBf16Candidate);
+            assert_eq!(provider, Qwen38KvStorageProvider::CudaBf16);
             assert_eq!(provider.dtype(), DType::BF16);
             assert!(provider.fallback_reason().is_none());
         }
@@ -2656,21 +3410,29 @@ mod tests {
     }
 
     #[test]
-    fn cuda_bf16_kv_candidate_requires_observed_ampere_or_newer_capability() {
+    fn cuda_bf16_kv_requires_observed_ampere_or_newer_capability() {
         for compute_capability in [None, Some((7, 5))] {
-            let provider =
-                Qwen38KvStorageProvider::select(BackendKind::Cuda, compute_capability, Some("1"));
-            assert_eq!(provider, Qwen38KvStorageProvider::CudaF16CapabilityFallback);
-            assert_eq!(provider.dtype(), DType::F16);
-            assert!(provider
-                .fallback_reason()
-                .expect("capability fallback reason")
-                .contains("8.0 or newer"));
+            for requested in [None, Some("1")] {
+                let provider = Qwen38KvStorageProvider::select(
+                    BackendKind::Cuda,
+                    compute_capability,
+                    requested,
+                );
+                assert_eq!(provider, Qwen38KvStorageProvider::CudaF16CapabilityFallback);
+                assert_eq!(provider.dtype(), DType::F16);
+                assert!(provider
+                    .fallback_reason()
+                    .expect("capability fallback reason")
+                    .contains("8.0 or newer"));
+            }
         }
-        assert_eq!(
-            Qwen38KvStorageProvider::select(BackendKind::Cuda, Some((9, 0)), Some("1")),
-            Qwen38KvStorageProvider::CudaBf16Candidate
-        );
+        for capability in [(8, 0), (8, 6), (8, 9), (9, 0), (10, 0)] {
+            let provider =
+                Qwen38KvStorageProvider::select(BackendKind::Cuda, Some(capability), None);
+            assert_eq!(provider, Qwen38KvStorageProvider::CudaBf16);
+            assert_eq!(provider.dtype(), DType::BF16);
+            assert_eq!(provider.dtype().size_in_bytes(), DType::F16.size_in_bytes());
+        }
     }
 
     #[test]

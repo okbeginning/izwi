@@ -12,6 +12,7 @@ use serde::Serialize;
 pub(crate) struct Qwen38OptimizationTelemetrySnapshot {
     pub cuda_projection_calls_total: u64,
     pub cuda_q8_projection_calls_total: u64,
+    pub cuda_native_fp8_projection_calls_total: u64,
     pub cuda_dense_projection_calls_total: u64,
     pub cuda_attention_dtype_casts_total: u64,
     pub cuda_bf16_kv_provider_selected_total: u64,
@@ -52,12 +53,22 @@ pub(crate) struct Qwen38OptimizationTelemetrySnapshot {
     pub mtp_enabled_loads_total: u64,
     pub mtp_disabled_loads_total: u64,
     pub mtp_scalar_target_tokens_total: u64,
+    pub mtp_nonfinite_draft_fallbacks_total: u64,
     pub mtp_rounds_total: u64,
     pub mtp_draft_tokens_total: u64,
     pub mtp_accepted_draft_tokens_total: u64,
     pub mtp_rejected_rounds_total: u64,
     pub mtp_bonus_tokens_total: u64,
     pub mtp_target_verified_tokens_total: u64,
+    pub mtp_round_submit_wall_ns_total: u64,
+    pub mtp_adaptive_completed_ns_total: u64,
+    pub mtp_input_committed_tokens_total: u64,
+    pub mtp_prefix_recovery_tokens_total: u64,
+    pub mtp_adaptive_scalar_rounds_total: u64,
+    pub mtp_budget_scalar_rounds_total: u64,
+    pub mtp_depth_one_rounds_total: u64,
+    pub mtp_depth_two_rounds_total: u64,
+    pub mtp_depth_three_rounds_total: u64,
     pub mtp_target_replay_tokens_total: u64,
 }
 
@@ -70,6 +81,7 @@ macro_rules! counters {
 counters!(
     CUDA_PROJECTION_CALLS,
     CUDA_Q8_PROJECTION_CALLS,
+    CUDA_NATIVE_FP8_PROJECTION_CALLS,
     CUDA_DENSE_PROJECTION_CALLS,
     CUDA_ATTENTION_DTYPE_CASTS,
     CUDA_BF16_KV_PROVIDER_SELECTED,
@@ -110,17 +122,28 @@ counters!(
     MTP_ENABLED_LOADS,
     MTP_DISABLED_LOADS,
     MTP_SCALAR_TARGET_TOKENS,
+    MTP_NONFINITE_DRAFT_FALLBACKS,
     MTP_ROUNDS,
     MTP_DRAFT_TOKENS,
     MTP_ACCEPTED_DRAFT_TOKENS,
     MTP_REJECTED_ROUNDS,
     MTP_BONUS_TOKENS,
     MTP_TARGET_VERIFIED_TOKENS,
+    MTP_ROUND_WALL_NS,
+    MTP_ADAPTIVE_COMPLETED_NS,
+    MTP_INPUT_COMMITTED_TOKENS,
+    MTP_PREFIX_RECOVERY_TOKENS,
+    MTP_ADAPTIVE_SCALAR_ROUNDS,
+    MTP_BUDGET_SCALAR_ROUNDS,
+    MTP_DEPTH_ONE_ROUNDS,
+    MTP_DEPTH_TWO_ROUNDS,
+    MTP_DEPTH_THREE_ROUNDS,
     MTP_TARGET_REPLAY_TOKENS,
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CudaProjectionPath {
+    NativeFp8,
     Q8,
     Dense,
 }
@@ -140,6 +163,9 @@ pub(crate) enum CudaKernelPath {
 pub(crate) fn record_cuda_projection(path: CudaProjectionPath) {
     CUDA_PROJECTION_CALLS.fetch_add(1, Ordering::Relaxed);
     match path {
+        CudaProjectionPath::NativeFp8 => {
+            CUDA_NATIVE_FP8_PROJECTION_CALLS.fetch_add(1, Ordering::Relaxed)
+        }
         CudaProjectionPath::Q8 => CUDA_Q8_PROJECTION_CALLS.fetch_add(1, Ordering::Relaxed),
         CudaProjectionPath::Dense => CUDA_DENSE_PROJECTION_CALLS.fetch_add(1, Ordering::Relaxed),
     };
@@ -249,11 +275,13 @@ pub(crate) fn record_mtp_policy(enabled: bool) {
     }
 }
 
-/// Record a target-only decode token taken while the model has an MTP head.
-///
-/// The scheduler intentionally selects this path under queue pressure or when
-/// only one output slot remains. Keeping it distinct from speculative rounds
-/// prevents "MTP loaded" from being mistaken for "MTP executed".
+/// Requests switched to target-only sampling after unusable MTP logits.
+pub(crate) fn record_mtp_nonfinite_draft_fallback() {
+    MTP_NONFINITE_DRAFT_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a target-only token while the model has an MTP head, whether selected
+/// by the scheduler, the adaptive controller, or numerical draft recovery.
 pub(crate) fn record_mtp_scalar_target_token() {
     MTP_SCALAR_TARGET_TOKENS.fetch_add(1, Ordering::Relaxed);
 }
@@ -278,6 +306,36 @@ pub(crate) fn record_mtp_round(
     MTP_TARGET_REPLAY_TOKENS.fetch_add(target_replayed as u64, Ordering::Relaxed);
 }
 
+pub(crate) fn record_mtp_round_timing(
+    depth: usize,
+    committed: usize,
+    elapsed: std::time::Duration,
+    recovered: usize,
+    budget: usize,
+) {
+    MTP_ROUND_WALL_NS.fetch_add(
+        elapsed.as_nanos().min(u64::MAX as u128) as u64,
+        Ordering::Relaxed,
+    );
+    MTP_INPUT_COMMITTED_TOKENS.fetch_add(committed as u64, Ordering::Relaxed);
+    MTP_PREFIX_RECOVERY_TOKENS.fetch_add(recovered as u64, Ordering::Relaxed);
+    match depth {
+        0 if budget <= 1 => &MTP_BUDGET_SCALAR_ROUNDS,
+        0 => &MTP_ADAPTIVE_SCALAR_ROUNDS,
+        1 => &MTP_DEPTH_ONE_ROUNDS,
+        2 => &MTP_DEPTH_TWO_ROUNDS,
+        _ => &MTP_DEPTH_THREE_ROUNDS,
+    }
+    .fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_mtp_completed_timing(elapsed: std::time::Duration) {
+    MTP_ADAPTIVE_COMPLETED_NS.fetch_add(
+        elapsed.as_nanos().min(u64::MAX as u128) as u64,
+        Ordering::Relaxed,
+    );
+}
+
 pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
     macro_rules! load {
         ($name:ident) => {
@@ -287,6 +345,7 @@ pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
     Qwen38OptimizationTelemetrySnapshot {
         cuda_projection_calls_total: load!(CUDA_PROJECTION_CALLS),
         cuda_q8_projection_calls_total: load!(CUDA_Q8_PROJECTION_CALLS),
+        cuda_native_fp8_projection_calls_total: load!(CUDA_NATIVE_FP8_PROJECTION_CALLS),
         cuda_dense_projection_calls_total: load!(CUDA_DENSE_PROJECTION_CALLS),
         cuda_attention_dtype_casts_total: load!(CUDA_ATTENTION_DTYPE_CASTS),
         cuda_bf16_kv_provider_selected_total: load!(CUDA_BF16_KV_PROVIDER_SELECTED),
@@ -333,12 +392,22 @@ pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
         mtp_enabled_loads_total: load!(MTP_ENABLED_LOADS),
         mtp_disabled_loads_total: load!(MTP_DISABLED_LOADS),
         mtp_scalar_target_tokens_total: load!(MTP_SCALAR_TARGET_TOKENS),
+        mtp_nonfinite_draft_fallbacks_total: load!(MTP_NONFINITE_DRAFT_FALLBACKS),
         mtp_rounds_total: load!(MTP_ROUNDS),
         mtp_draft_tokens_total: load!(MTP_DRAFT_TOKENS),
         mtp_accepted_draft_tokens_total: load!(MTP_ACCEPTED_DRAFT_TOKENS),
         mtp_rejected_rounds_total: load!(MTP_REJECTED_ROUNDS),
         mtp_bonus_tokens_total: load!(MTP_BONUS_TOKENS),
         mtp_target_verified_tokens_total: load!(MTP_TARGET_VERIFIED_TOKENS),
+        mtp_round_submit_wall_ns_total: load!(MTP_ROUND_WALL_NS),
+        mtp_adaptive_completed_ns_total: load!(MTP_ADAPTIVE_COMPLETED_NS),
+        mtp_input_committed_tokens_total: load!(MTP_INPUT_COMMITTED_TOKENS),
+        mtp_prefix_recovery_tokens_total: load!(MTP_PREFIX_RECOVERY_TOKENS),
+        mtp_adaptive_scalar_rounds_total: load!(MTP_ADAPTIVE_SCALAR_ROUNDS),
+        mtp_budget_scalar_rounds_total: load!(MTP_BUDGET_SCALAR_ROUNDS),
+        mtp_depth_one_rounds_total: load!(MTP_DEPTH_ONE_ROUNDS),
+        mtp_depth_two_rounds_total: load!(MTP_DEPTH_TWO_ROUNDS),
+        mtp_depth_three_rounds_total: load!(MTP_DEPTH_THREE_ROUNDS),
         mtp_target_replay_tokens_total: load!(MTP_TARGET_REPLAY_TOKENS),
     }
 }

@@ -16,7 +16,7 @@ pub use crate::kv::v2::{StateClock, StateGroupId};
 use crate::kv::{CacheBlockRef, CacheDomainId, KvArenaId, KvSlotRef};
 use crate::model::ModelVariant;
 
-use super::resources::{ResourceEstimate, ResourceVector};
+use super::resources::{ResourceAmount, ResourceEstimate, ResourceVector};
 use super::{RequestId, SequenceId, TaskType};
 
 pub type PlanId = u64;
@@ -911,6 +911,22 @@ impl Default for WorkCost {
     }
 }
 
+/// Shared by loaded chat admission and exact request preparation so host
+/// collation is included in both the stage ceiling and each row's claim.
+pub(crate) fn continuous_chat_workspace_per_row(accelerator_bytes: u64) -> Result<ResourceVector> {
+    let host_bytes = u64::try_from(std::mem::size_of::<u32>() + 4 * std::mem::size_of::<usize>())
+        .map_err(|_| {
+        Error::Overloaded("continuous decode host workspace estimate overflow".into())
+    })?;
+    let workspace = ResourceVector {
+        host_bytes: ResourceAmount::Known(host_bytes),
+        temporary_bytes: ResourceAmount::Known(accelerator_bytes),
+        ..ResourceVector::zero()
+    };
+    workspace.workspace_bytes()?;
+    Ok(workspace)
+}
+
 pub(crate) fn continuous_asr_host_workspace_per_row_bytes() -> Result<u64> {
     u64::try_from(std::mem::size_of::<u32>() + 4 * std::mem::size_of::<usize>())
         .map_err(|_| Error::Overloaded("continuous ASR host workspace estimate overflow".into()))
@@ -1213,6 +1229,10 @@ pub struct ExecutionProfile {
     /// transaction. The scheduler may reduce this for fairness or latency.
     #[serde(default = "default_preferred_decode_tokens")]
     pub preferred_decode_tokens: usize,
+    /// A loaded CUDA adapter may retain its isolated multi-token quantum after
+    /// a soft scheduling SLA. This never relaxes hard deadlines or peer fairness.
+    #[serde(default)]
+    pub sustained_decode_quantum: bool,
     pub resolved_from_loaded_model: bool,
     pub compute_dtype: String,
     pub kv_dtype: String,
@@ -1249,6 +1269,7 @@ impl ExecutionProfile {
             prefix_reuse_safe: false,
             max_batch_size: 1,
             preferred_decode_tokens: 1,
+            sustained_decode_quantum: false,
             resolved_from_loaded_model: false,
             compute_dtype: "unknown".to_string(),
             kv_dtype: "none".to_string(),
@@ -1288,6 +1309,14 @@ impl ExecutionProfile {
         } else {
             PhysicalLaunchPolicy::ExecutionGroupExclusive
         }
+    }
+
+    pub fn effective_sustained_decode_quantum(&self) -> bool {
+        self.resolved_from_loaded_model
+            && self.backend == BackendKind::Cuda
+            && self.incremental_decode
+            && self.preferred_decode_tokens > 1
+            && self.sustained_decode_quantum
     }
 }
 

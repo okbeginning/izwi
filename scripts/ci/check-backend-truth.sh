@@ -132,6 +132,7 @@ run_core_scheduler_regressions() {
         engine::executor
         engine::execution
         engine::output
+        backends::kv::precision_tests
     )
 
     if [[ -n "${features}" ]]; then
@@ -452,6 +453,7 @@ run_hygiene() {
     scripts/test-install-cli-backend-selection.sh
     scripts/bench/test-run-cuda-model-evidence.sh
     scripts/bench/test-run-cuda-model-load-evidence.sh
+    PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-cuda-chat-concurrency.py
 }
 
 run_cargo_cuda_compile() {
@@ -498,6 +500,18 @@ run_cargo_cuda_device_profile() {
     cargo check --locked -p izwi-cli --features "${wrapper_features}"
     cargo check --locked -p izwi-server --features "${wrapper_features}"
     run_core_scheduler_regressions "${core_features}"
+    # These are real-device checks, including new projection, sampling,
+    # graph-lifetime and tiled-loading probes. A requested CUDA device may not
+    # silently fall back to CPU and still produce a certification record.
+    for suite in kernels::cuda models::architectures::qwen38 models::shared::attention::physical; do
+        IZWI_REQUIRE_CUDA_TEST_DEVICE=1 cargo test --locked -p izwi-core \
+            --features "${core_features}" "${suite}" --lib -- --test-threads=1
+    done
+    if [[ ",${core_features}," == *",flash-attn,"* ]]; then
+        cargo test --locked -p izwi-core --features "${core_features}" \
+            cuda_flash_paged_bf16_preserves_finite_kv_range --lib -- \
+            --ignored --test-threads=1
+    fi
     run_server_scheduler_regressions "${wrapper_features}"
     smoke_cuda_device_if_available "${wrapper_features}"
 }

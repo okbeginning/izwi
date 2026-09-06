@@ -1018,7 +1018,7 @@ impl From<&EngineCoreConfig> for WorkerConfig {
             )),
             max_tensor_batch_size,
             static_tensor_batch_variants: Arc::new(HashSet::new()),
-            enable_chunked_prefill: config.enable_chunked_prefill,
+            enable_chunked_prefill: config.effective_chunked_prefill(),
         }
     }
 }
@@ -1669,6 +1669,11 @@ pub trait ModelExecutor: Send + Sync {
     /// conservatively clear all state for the public request ID.
     fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
         self.cleanup_request(&session.request_id)
+    }
+
+    /// Release GPU state while retaining a CPU replay record for an exact session.
+    fn suspend_session_for_capacity(&self, _session: &SessionKey) -> Result<Option<usize>> {
+        Ok(None)
     }
 
     /// Purge model-owned reusable cache state before one model is unloaded.
@@ -2686,6 +2691,7 @@ pub struct NativeExecutor {
     initialized: bool,
     loaded_tts_model: Option<Arc<Qwen3TtsModel>>,
     chat_decode_states: ExecutorStateStore<ActiveChatDecode>,
+    suspended_chat_states: Mutex<HashMap<SessionKey, state::SuspendedChatDecode>>,
     asr_decode_states: ExecutorStateStore<ActiveAsrDecode>,
     parakeet_asr_decode_states: ExecutorStateStore<ActiveParakeetAsrDecode>,
     lfm25_asr_decode_states: ExecutorStateStore<ActiveLfm25AsrDecode>,
@@ -2821,6 +2827,7 @@ impl NativeExecutor {
             initialized: false,
             loaded_tts_model: None,
             chat_decode_states: Mutex::new(HashMap::new()),
+            suspended_chat_states: Mutex::new(HashMap::new()),
             asr_decode_states: Mutex::new(HashMap::new()),
             parakeet_asr_decode_states: Mutex::new(HashMap::new()),
             lfm25_asr_decode_states: Mutex::new(HashMap::new()),
@@ -3305,14 +3312,19 @@ impl ModelExecutor for NativeExecutor {
             profile.kv_dtype = "none".to_string();
         }
         if matches!(request.task_type, super::types::TaskType::Chat) {
-            profile.preferred_decode_tokens = request
+            let (preferred_decode_tokens, sustained_decode_quantum) = request
                 .prepared_chat_model_for_executor()
                 .ok()
                 .and_then(|model| match model.as_ref() {
-                    NativeChatModel::Qwen38(model) => Some(model.preferred_decode_tokens()),
+                    NativeChatModel::Qwen38(model) => Some((
+                        model.preferred_decode_tokens(),
+                        model.sustained_cuda_mtp_quantum(),
+                    )),
                     _ => None,
                 })
-                .unwrap_or(1);
+                .unwrap_or((1, false));
+            profile.preferred_decode_tokens = preferred_decode_tokens;
+            profile.sustained_decode_quantum = sustained_decode_quantum;
         }
         Some(profile)
     }
@@ -3755,6 +3767,11 @@ impl ModelExecutor for NativeExecutor {
     }
 
     fn cleanup_request(&self, request_id: &str) -> CacheReleaseReport {
+        let Ok(mut suspended) = self.suspended_chat_states.lock() else {
+            return CacheReleaseReport::unconfirmed();
+        };
+        suspended.retain(|session, _| session.request_id != request_id);
+        drop(suspended);
         if self
             .voxtral_realtime
             .abort_matching(|pending| pending.session.request_id == request_id)
@@ -3823,6 +3840,10 @@ impl ModelExecutor for NativeExecutor {
         )
     }
 
+    fn suspend_session_for_capacity(&self, session: &SessionKey) -> Result<Option<usize>> {
+        self.suspend_chat_session(session)
+    }
+
     fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
         if self
             .voxtral_realtime
@@ -3867,6 +3888,10 @@ impl ModelExecutor for NativeExecutor {
             return CacheReleaseReport::unconfirmed();
         };
 
+        let Ok(mut suspended) = self.suspended_chat_states.lock() else {
+            return CacheReleaseReport::unconfirmed();
+        };
+        suspended.remove(session);
         let chat = cleanup_session_state_locked(&mut chat, session);
         let asr = cleanup_session_state_locked(&mut asr, session);
         let parakeet_asr = cleanup_session_state_locked(&mut parakeet_asr, session);
@@ -3893,6 +3918,11 @@ impl ModelExecutor for NativeExecutor {
     }
 
     fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
+        let Ok(mut suspended) = self.suspended_chat_states.lock() else {
+            return CacheReleaseReport::unconfirmed();
+        };
+        suspended.retain(|_, state| state.variant != variant);
+        drop(suspended);
         if self
             .voxtral_realtime
             .abort_matching(|pending| pending.active.variant == variant)
@@ -4088,7 +4118,7 @@ impl UnifiedExecutor {
         }
         let Some(context) = self.batch_workspace.as_ref() else {
             record_engine_physical_defer(EnginePhysicalDeferReason::WorkspaceCapacity);
-            return Err(Error::Overloaded(
+            return Err(Error::InvalidInput(
                 "physical batch requires workspace but no resource authority is installed"
                     .to_string(),
             ));
@@ -4410,6 +4440,16 @@ impl UnifiedExecutor {
     pub async fn cleanup_request(&self, request_id: &str) -> CacheReleaseReport {
         let executor = self.inner.read().await;
         executor.cleanup_request(request_id)
+    }
+
+    pub(crate) async fn suspend_session_for_capacity(
+        &self,
+        session: &SessionKey,
+    ) -> Result<Option<usize>> {
+        self.inner
+            .read()
+            .await
+            .suspend_session_for_capacity(session)
     }
 
     pub async fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
